@@ -1,18 +1,34 @@
 # Nixodria OS
 
-Nixodria OS is a bootable command-line operating system contained in one
-512-byte x86 BIOS boot sector. It starts a serial console directly, without a
-bootloader, filesystem, processes, or networking.
+Nixodria OS is a tiny bootable x86 command-line operating system. Its first
+512-byte BIOS sector loads a two-sector real-mode kernel, producing a 1.5 KiB
+image. The kernel starts a serial console without a filesystem, processes, or
+networking.
 
 ## Commands
 
 - `help` — list commands
+- `edit` — open the in-memory text editor
 - `clear` — clear the terminal
 - `echo <text>` — print text
 - `reboot` — restart the OS through the BIOS
 - `halt` — stop the CPU
 
-The input line holds 31 characters and supports Backspace.
+The shell input line holds 31 characters and supports Backspace.
+
+## Text editor
+
+Run `edit` to open a 2 KiB scratchpad. Type at the end of the document, use
+Enter for a new line, and use Backspace to remove text. Both the BS and DEL
+terminal codes are accepted as Backspace. The editor redraws after deletion so
+editing remains correct across terminal line wraps.
+
+- Control-X — exit to the shell
+- Control-L — clear the entire document
+
+The editor retains up to 2,047 bytes while the OS remains booted. Its contents
+are stored only in RAM and are cleared by `reboot`; Nixodria does not yet have a
+filesystem.
 
 ## Build and run
 
@@ -28,8 +44,8 @@ Build the bootable image:
 make
 ```
 
-Check its exact size and BIOS signature, then boot it in QEMU and exercise the
-command loop:
+Check its exact image layout and BIOS signature, then boot it in QEMU and
+exercise the command loop and editor:
 
 ```sh
 make check
