@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prove runtime refreshes preserve Nixodria's mutable storage sectors."""
+"""Prove runtime refreshes preserve Nixodria's mutable file snapshots."""
 
 import os
 from pathlib import Path
@@ -10,14 +10,21 @@ import tempfile
 
 
 SECTOR_SIZE = 512
-SYSTEM_SECTORS = 8
-STORAGE_SECTORS = 10
-LEGACY_SYSTEM_SECTORS = 4
+IMAGE_SECTORS = 2880
+SYSTEM_SECTORS = 11
+SNAPSHOT_SECTORS = 33
+STORAGE_SECTORS = SNAPSHOT_SECTORS * 2
+LEGACY_SYSTEM_SECTORS = (8, 4)
+LEGACY_STORAGE_SECTORS = 10
+LEGACY_SLOT_SECTORS = 5
+IMAGE_SIZE = SECTOR_SIZE * IMAGE_SECTORS
 SYSTEM_SIZE = SECTOR_SIZE * SYSTEM_SECTORS
+SNAPSHOT_SIZE = SECTOR_SIZE * SNAPSHOT_SECTORS
 STORAGE_SIZE = SECTOR_SIZE * STORAGE_SECTORS
-IMAGE_SIZE = SECTOR_SIZE * (SYSTEM_SECTORS + STORAGE_SECTORS)
-LEGACY_SYSTEM_SIZE = SECTOR_SIZE * LEGACY_SYSTEM_SECTORS
-LEGACY_IMAGE_SIZE = SECTOR_SIZE * (LEGACY_SYSTEM_SECTORS + STORAGE_SECTORS)
+STORAGE_OFFSET = SYSTEM_SIZE
+STORAGE_END = STORAGE_OFFSET + STORAGE_SIZE
+LEGACY_STORAGE_SIZE = SECTOR_SIZE * LEGACY_STORAGE_SECTORS
+LEGACY_SLOT_SIZE = SECTOR_SIZE * LEGACY_SLOT_SECTORS
 
 
 def run_preparer(preparer: Path, template: Path, runtime: Path) -> None:
@@ -80,45 +87,71 @@ def main() -> int:
                 (index * 37 + 11) & 0xFF
                 for index in range(SECTOR_SIZE * STORAGE_SECTORS)
             )
-            runtime.write_bytes(template_data[:SYSTEM_SIZE] + storage)
+            runtime_data = bytearray(template_data)
+            runtime_data[STORAGE_OFFSET:STORAGE_END] = storage
+            runtime_data[STORAGE_END + 17] ^= 0xA5
+            runtime.write_bytes(runtime_data)
             os.chmod(runtime, 0o600)
 
             refreshed_template = bytearray(template_data)
             refreshed_template[SYSTEM_SIZE - 1] ^= 0x5A
+            refreshed_template[STORAGE_END + 17] ^= 0x3C
             template.write_bytes(refreshed_template)
             run_preparer(preparer, template, runtime)
 
             result = runtime.read_bytes()
             if template.read_bytes() != bytes(refreshed_template):
                 raise RuntimeError("runtime refresh changed its template")
-            if result[:SYSTEM_SIZE] != refreshed_template[:SYSTEM_SIZE]:
-                raise RuntimeError("runtime refresh did not install new system sectors")
-            if result[SYSTEM_SIZE:] != storage:
-                raise RuntimeError("runtime refresh changed persistent storage")
+            expected_refresh = bytearray(refreshed_template)
+            expected_refresh[STORAGE_OFFSET:STORAGE_END] = storage
+            if result != bytes(expected_refresh):
+                raise RuntimeError(
+                    "runtime refresh did not replace immutable sectors while "
+                    "preserving file snapshots"
+                )
             if stat.S_IMODE(runtime.stat().st_mode) != 0o600:
                 raise RuntimeError("refreshed runtime image is not private mode 0600")
 
-            legacy = root / "legacy.img"
             legacy_storage = bytes(
-                (index * 19 + 7) & 0xFF for index in range(STORAGE_SIZE)
+                (index * 19 + 7) & 0xFF for index in range(LEGACY_STORAGE_SIZE)
             )
-            legacy_data = template_data[:LEGACY_SYSTEM_SIZE] + legacy_storage
-            if len(legacy_data) != LEGACY_IMAGE_SIZE:
-                raise RuntimeError("legacy migration fixture has the wrong size")
-            legacy.write_bytes(legacy_data)
-            os.chmod(legacy, 0o644)
-            run_preparer(preparer, template, legacy)
+            for legacy_system_sectors in LEGACY_SYSTEM_SECTORS:
+                legacy = root / f"legacy-{legacy_system_sectors}.img"
+                legacy_system_size = SECTOR_SIZE * legacy_system_sectors
+                legacy_data = (
+                    template_data[:legacy_system_size] + legacy_storage
+                )
+                expected_size = legacy_system_size + LEGACY_STORAGE_SIZE
+                if len(legacy_data) != expected_size:
+                    raise RuntimeError("legacy migration fixture has the wrong size")
+                legacy.write_bytes(legacy_data)
+                os.chmod(legacy, 0o644)
+                run_preparer(preparer, template, legacy)
 
-            migrated = legacy.read_bytes()
-            expected_migration = bytes(refreshed_template[:SYSTEM_SIZE]) + legacy_storage
-            if migrated != expected_migration:
-                raise RuntimeError("legacy migration did not preserve its storage sectors")
-            if stat.S_IMODE(legacy.stat().st_mode) != 0o600:
-                raise RuntimeError("migrated runtime image is not private mode 0600")
+                migrated = legacy.read_bytes()
+                expected_migration = bytearray(refreshed_template)
+                expected_migration[
+                    STORAGE_OFFSET : STORAGE_OFFSET + LEGACY_SLOT_SIZE
+                ] = legacy_storage[:LEGACY_SLOT_SIZE]
+                expected_migration[
+                    STORAGE_OFFSET + SNAPSHOT_SIZE :
+                    STORAGE_OFFSET + SNAPSHOT_SIZE + LEGACY_SLOT_SIZE
+                ] = legacy_storage[LEGACY_SLOT_SIZE:]
+                if migrated != bytes(expected_migration):
+                    raise RuntimeError(
+                        f"legacy {legacy_system_sectors}-sector-system migration "
+                        "did not place both NIX2 records into the NIX3 snapshots"
+                    )
+                if stat.S_IMODE(legacy.stat().st_mode) != 0o600:
+                    raise RuntimeError(
+                        "migrated runtime image is not private mode 0600"
+                    )
 
-            run_preparer(preparer, template, legacy)
-            if legacy.read_bytes() != expected_migration:
-                raise RuntimeError("second refresh changed the migrated runtime image")
+                run_preparer(preparer, template, legacy)
+                if legacy.read_bytes() != bytes(expected_migration):
+                    raise RuntimeError(
+                        "second refresh changed the migrated runtime image"
+                    )
 
             malformed = root / "malformed.img"
             malformed_bytes = b"existing state must not be overwritten"
@@ -128,7 +161,10 @@ def main() -> int:
                 raise RuntimeError("failed refresh overwrote malformed runtime state")
 
             unsigned_legacy = root / "unsigned-legacy.img"
-            unsigned_data = bytes(LEGACY_IMAGE_SIZE)
+            unsigned_data = bytes(
+                SECTOR_SIZE
+                * (LEGACY_SYSTEM_SECTORS[0] + LEGACY_STORAGE_SECTORS)
+            )
             unsigned_legacy.write_bytes(unsigned_data)
             assert_preparer_fails(preparer, template, unsigned_legacy)
             if unsigned_legacy.read_bytes() != unsigned_data:
@@ -156,7 +192,7 @@ def main() -> int:
         print(f"runtime-check: {error}", file=sys.stderr)
         return 1
 
-    print("runtime-check: refresh and legacy migration preserved persistent storage")
+    print("runtime-check: refresh and NIX2 migration preserved file snapshots")
     return 0
 
 
