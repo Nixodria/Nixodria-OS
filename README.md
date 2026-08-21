@@ -115,3 +115,23 @@ The reproducible blank image is `build/nixodria.img`. `make run` boots the
 gitignored `.nixodria/nixodria.img` runtime copy. Normal rebuilds refresh only
 its boot and kernel sectors, while preserving its saved document; `make clean`
 also leaves this runtime copy intact.
+
+### Run inside Nixodria for Android
+
+[Nixodria](https://github.com/Nixodria/Nixodria) provides an Alpine userland,
+not a BIOS virtual machine, so this x86 image runs there through Alpine's
+full-system QEMU package. In a Nixodria terminal:
+
+```sh
+apk add --no-cache git make nasm python3 qemu-system-i386
+git clone https://github.com/Nixodria/Nixodria-OS.git
+cd Nixodria-OS
+make check
+make run
+```
+
+Keep the checkout under `/root` if editor saves should survive Nixodria's
+normal Linux reset. The run target uses TCG software emulation, needs no KVM or
+root access, connects COM1 to Nixodria's terminal, and creates no virtual
+network device. Nixodria also provides a first-class dashboard action that
+performs a pinned, verified version of this setup after confirmation.

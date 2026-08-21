@@ -30,7 +30,7 @@ runtime-image: $(IMAGE)
 run: runtime-image
 	$(QEMU) -accel tcg -boot a \
 		-drive format=raw,file="$(RUNTIME_IMAGE)",if=floppy,cache=writethrough \
-		-display none -serial stdio -monitor none \
+		-display none -serial stdio -monitor none -nic none \
 		-no-reboot -no-shutdown
 
 clean:
