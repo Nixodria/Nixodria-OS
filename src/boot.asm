@@ -4,11 +4,12 @@ org 0x7c00
 COM1            equ 0x3f8
 SHELL_BUFFER    equ 0x0600
 SHELL_CAPACITY  equ 32
+BASIC_VARS      equ 0x0800
 STORAGE_HEADER_A equ 0x8c00
 STORAGE_HEADER_B equ 0x8e00
 EDITOR_BUFFER   equ 0x9000
 EDITOR_CAPACITY equ 2048
-KERNEL_SECTORS  equ 3
+KERNEL_SECTORS  equ 7
 STORAGE_SECTOR_A equ KERNEL_SECTORS + 2
 STORAGE_SLOT_SECTORS equ 5
 STORAGE_SECTOR_B equ STORAGE_SECTOR_A + STORAGE_SLOT_SECTORS
@@ -247,6 +248,8 @@ command_edit:
     je .exit
     cmp al, 19
     je .save
+    cmp al, 18
+    je .run
     cmp al, 12
     je .clear
     cmp al, 8
@@ -312,6 +315,14 @@ command_edit:
     inc byte [editor_status]
 .saved:
     call editor_redraw
+    jmp .read
+
+.run:
+    call basic_run
+    call editor_redraw
+    ; If Enter dismissed the output screen, ignore a following LF without
+    ; changing the document. Any other key clears this state normally.
+    mov bp, 1
     jmp .read
 
 .full:
@@ -689,6 +700,474 @@ storage_checksum:
     pop ax
     ret
 
+; Run the current editor buffer as a small, line-numbered BASIC program.
+; The editor's position and document length are preserved across execution.
+basic_run:
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+    push bp
+
+    mov si, basic_output
+    call print_string
+    mov di, BASIC_VARS
+    xor ax, ax
+    mov cx, 26
+    rep stosw
+    mov word [basic_steps], 10001
+    mov si, EDITOR_BUFFER
+
+.next_line:
+    call basic_skip_spaces
+    cmp byte [si], 0
+    je .finished
+    cmp byte [si], 13
+    je .blank
+
+    mov word [basic_line], 0
+    call basic_parse_uint
+    jnc .error
+    mov [basic_line], ax
+    dec word [basic_steps]
+    jz .error
+    call basic_skip_spaces
+
+    mov di, basic_kw_print
+    call basic_keyword
+    jc .print
+    mov di, basic_kw_let
+    call basic_keyword
+    jc .let
+    mov di, basic_kw_if
+    call basic_keyword
+    jc .if
+    mov di, basic_kw_goto
+    call basic_keyword
+    jc .goto
+    mov di, basic_kw_rem
+    call basic_keyword
+    jc .rem
+    mov di, basic_kw_end
+    call basic_keyword
+    jc .end
+    jmp .error
+
+.blank:
+    call basic_next_line
+    jmp .next_line
+
+.print:
+    call basic_skip_spaces
+    cmp byte [si], '"'
+    jne .print_number
+    inc si
+.print_text:
+    lodsb
+    test al, al
+    jz .error
+    cmp al, 13
+    je .error
+    cmp al, '"'
+    je .print_done
+    call serial_write
+    jmp .print_text
+.print_number:
+    call basic_expression
+    jnc .error
+    push ax
+    call basic_end_line
+    pop ax
+    jnc .error
+    call basic_print_integer
+    jmp .printed
+.print_done:
+    call basic_end_line
+    jnc .error
+.printed:
+    push si
+    mov si, newline
+    call print_string
+    pop si
+    jmp .next_line
+
+.let:
+    call basic_variable_address
+    jnc .error
+    push di
+    call basic_skip_spaces
+    cmp byte [si], '='
+    jne .let_error
+    inc si
+    call basic_expression
+    pop di
+    jnc .error
+    push ax
+    call basic_end_line
+    pop ax
+    jnc .error
+    mov [di], ax
+    jmp .next_line
+.let_error:
+    pop di
+    jmp .error
+
+.goto:
+    call basic_skip_spaces
+    call basic_parse_uint
+    jnc .error
+    mov dx, ax
+    call basic_end_line
+    jnc .error
+    call basic_find_line
+    jnc .error
+    jmp .next_line
+
+.if:
+    call basic_expression
+    jnc .error
+    mov [basic_left], ax
+    call basic_skip_spaces
+    mov al, [si]
+    cmp al, '='
+    je .have_operator
+    cmp al, '<'
+    je .have_operator
+    cmp al, '>'
+    jne .error
+.have_operator:
+    mov [basic_operator], al
+    inc si
+    call basic_expression
+    jnc .error
+    mov dx, ax
+    mov ax, [basic_left]
+    xor bx, bx
+    cmp byte [basic_operator], '='
+    je .if_equal
+    cmp byte [basic_operator], '<'
+    je .if_less
+    cmp ax, dx
+    jle .condition_ready
+    jmp .condition_true
+.if_less:
+    cmp ax, dx
+    jge .condition_ready
+    jmp .condition_true
+.if_equal:
+    cmp ax, dx
+    jne .condition_ready
+.condition_true:
+    inc bx
+.condition_ready:
+    mov di, basic_kw_then
+    call basic_keyword
+    jnc .error
+    call basic_skip_spaces
+    call basic_parse_uint
+    jnc .error
+    mov dx, ax
+    call basic_end_line
+    jnc .error
+    test bx, bx
+    jz .next_line
+    call basic_find_line
+    jnc .error
+    jmp .next_line
+
+.rem:
+    call basic_next_line
+    jmp .next_line
+
+.end:
+    call basic_end_line
+    jnc .error
+.finished:
+    mov si, basic_finished
+    jmp .pause
+.error:
+    mov si, basic_error
+    call print_string
+    mov ax, [basic_line]
+    call basic_print_unsigned
+    mov si, basic_error_end
+.pause:
+    call print_string
+    call serial_read
+
+    pop bp
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+; Carry is set when the lowercase keyword at DI matches SI case-insensitively.
+; SI advances past the keyword only on a whole-word match.
+basic_keyword:
+    push bx
+    mov bx, si
+.compare:
+    mov al, [di]
+    test al, al
+    jz .boundary
+    mov ah, [si]
+    or ah, 0x20
+    cmp ah, al
+    jne .different
+    inc si
+    inc di
+    jmp .compare
+.boundary:
+    mov al, [si]
+    cmp al, ' '
+    je .matched
+    cmp al, 13
+    je .matched
+    test al, al
+    jz .matched
+.different:
+    mov si, bx
+    clc
+    pop bx
+    ret
+.matched:
+    stc
+    pop bx
+    ret
+
+basic_skip_spaces:
+    cmp byte [si], ' '
+    jne .done
+    inc si
+    jmp basic_skip_spaces
+.done:
+    ret
+
+; Parse an unsigned decimal at SI into AX.
+basic_parse_uint:
+    cmp byte [si], '0'
+    jb .invalid
+    cmp byte [si], '9'
+    ja .invalid
+    xor ax, ax
+.digit:
+    cmp byte [si], '0'
+    jb .valid
+    cmp byte [si], '9'
+    ja .valid
+    mov cx, 10
+    mul cx
+    test dx, dx
+    jnz .invalid
+    xor dx, dx
+    mov dl, [si]
+    sub dl, '0'
+    add ax, dx
+    jc .invalid
+    inc si
+    jmp .digit
+.valid:
+    stc
+    ret
+.invalid:
+    clc
+    ret
+
+; Parse a signed literal or single-letter variable into AX.
+basic_value:
+    call basic_skip_spaces
+    xor bx, bx
+    cmp byte [si], '-'
+    je .negative
+    cmp byte [si], '+'
+    jne .value
+    inc si
+    call basic_skip_spaces
+    jmp .value
+.negative:
+    inc si
+    inc bx
+    call basic_skip_spaces
+.value:
+    cmp byte [si], '0'
+    jb .variable
+    cmp byte [si], '9'
+    ja .variable
+    call basic_parse_uint
+    jnc .invalid
+    test bx, bx
+    jnz .negative_literal
+    cmp ax, 0x7fff
+    ja .invalid
+    jmp .valid
+.negative_literal:
+    cmp ax, 0x8000
+    ja .invalid
+    neg ax
+    jmp .valid
+.variable:
+    call basic_variable_address
+    jnc .invalid
+    mov ax, [di]
+    test bx, bx
+    jz .valid
+    neg ax
+.valid:
+    stc
+    ret
+.invalid:
+    clc
+    ret
+
+; Parse values joined by + or - from left to right.
+basic_expression:
+    call basic_value
+    jnc .invalid
+    mov dx, ax
+.operator:
+    call basic_skip_spaces
+    cmp byte [si], '+'
+    je .add
+    cmp byte [si], '-'
+    je .subtract
+    mov ax, dx
+    stc
+    ret
+.add:
+    inc si
+    push dx
+    call basic_value
+    pop dx
+    jnc .invalid
+    add dx, ax
+    jmp .operator
+.subtract:
+    inc si
+    push dx
+    call basic_value
+    pop dx
+    jnc .invalid
+    sub dx, ax
+    jmp .operator
+.invalid:
+    clc
+    ret
+
+; Return the address of a case-insensitive A-Z variable in DI.
+basic_variable_address:
+    call basic_skip_spaces
+    mov al, [si]
+    or al, 0x20
+    cmp al, 'a'
+    jb .invalid
+    cmp al, 'z'
+    ja .invalid
+    sub al, 'a'
+    xor ah, ah
+    shl ax, 1
+    mov di, BASIC_VARS
+    add di, ax
+    inc si
+    stc
+    ret
+.invalid:
+    clc
+    ret
+
+; Accept only spaces through the end of a statement and advance to the next.
+basic_end_line:
+    call basic_skip_spaces
+    cmp byte [si], 0
+    je .valid
+    cmp byte [si], 13
+    jne .invalid
+    inc si
+    cmp byte [si], 10
+    jne .valid
+    inc si
+.valid:
+    stc
+    ret
+.invalid:
+    clc
+    ret
+
+basic_next_line:
+    mov al, [si]
+    test al, al
+    jz .done
+    inc si
+    cmp al, 13
+    jne basic_next_line
+    cmp byte [si], 10
+    jne .done
+    inc si
+.done:
+    ret
+
+; Find the first physical line numbered DX and return its start in SI.
+basic_find_line:
+    mov si, EDITOR_BUFFER
+.scan:
+    call basic_skip_spaces
+    cmp byte [si], 0
+    je .missing
+    cmp byte [si], 13
+    je .advance
+    mov bx, si
+    push dx
+    call basic_parse_uint
+    pop dx
+    jnc .advance
+    cmp ax, dx
+    je .found
+.advance:
+    call basic_next_line
+    jmp .scan
+.found:
+    mov si, bx
+    stc
+    ret
+.missing:
+    clc
+    ret
+
+basic_print_integer:
+    test ax, ax
+    jns basic_print_unsigned
+    push ax
+    mov al, '-'
+    call serial_write
+    pop ax
+    neg ax
+basic_print_unsigned:
+    test ax, ax
+    jnz .divide
+    mov al, '0'
+    call serial_write
+    ret
+.divide:
+    xor cx, cx
+    mov bx, 10
+.next_digit:
+    xor dx, dx
+    div bx
+    push dx
+    inc cx
+    test ax, ax
+    jnz .next_digit
+.write_digit:
+    pop ax
+    add al, '0'
+    call serial_write
+    loop .write_digit
+    ret
+
 command_clear:
     mov si, clear_sequence
     call print_string
@@ -770,7 +1249,7 @@ newline        db 13, 10, 0
 erase          db 8, ' ', 8, 0
 unknown        db 'Unknown command.', 13, 10, 0
 help_text      db 'help edit clear echo <text> reboot halt', 13, 10, 0
-editor_header  db 'Nixodria Editor', 13, 10, 'Ctrl-S save | Ctrl-X exit | Ctrl-L clear', 13, 10, 0
+editor_header  db 'Nixodria Editor', 13, 10, 'Ctrl-S save | Ctrl-R run | Ctrl-X exit | Ctrl-L clear', 13, 10, 0
 clear_sequence db 27, '[2J', 27, '[H', 0
 saved          db 'Saved.', 13, 10, 0
 save_failed    db 'Save failed.', 13, 10, 0
@@ -782,6 +1261,17 @@ cmd_clear      db 'clear', 0
 cmd_reboot     db 'reboot', 0
 cmd_halt       db 'halt', 0
 cmd_echo       db 'echo ', 0
+basic_output   db 27, '[2J', 27, '[H', 'Nixodria BASIC', 13, 10, 13, 10, 0
+basic_finished db 13, 10, 'Program finished. Press any key.', 0
+basic_error    db 13, 10, 'BASIC error at line ', 0
+basic_error_end db '. Press any key.', 0
+basic_kw_print db 'print', 0
+basic_kw_let   db 'let', 0
+basic_kw_if    db 'if', 0
+basic_kw_goto  db 'goto', 0
+basic_kw_rem   db 'rem', 0
+basic_kw_end   db 'end', 0
+basic_kw_then  db 'then', 0
 editor_status  db 0
 active_slot    db 0xff
 active_generation dw 0
@@ -794,6 +1284,10 @@ save_target    db 0
 disk_request   dw 0
 disk_buffer    dw 0
 disk_sector    db 0
+basic_line     dw 0
+basic_steps    dw 0
+basic_left     dw 0
+basic_operator db 0
 
 ; Keep executable code inside the sectors loaded by the first-stage loader.
 times (1 + KERNEL_SECTORS) * 512 - ($ - $$) db 0

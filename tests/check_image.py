@@ -6,7 +6,7 @@ import sys
 
 
 SECTOR_SIZE = 512
-SYSTEM_SECTORS = 4
+SYSTEM_SECTORS = 8
 STORAGE_SECTORS = 10
 IMAGE_SECTORS = SYSTEM_SECTORS + STORAGE_SECTORS
 IMAGE_SIZE = SECTOR_SIZE * IMAGE_SECTORS
@@ -31,6 +31,9 @@ def main() -> int:
         b"nix> ",
         b"Nixodria Editor",
         b"Ctrl-S save",
+        b"Ctrl-R run",
+        b"Nixodria BASIC",
+        b"BASIC error at line",
         b"Saved.",
         b"Save failed.",
         b"NIX2",
@@ -45,7 +48,7 @@ def main() -> int:
         print("check: newly built persistent storage is not blank", file=sys.stderr)
         return 1
 
-    print("check: fourteen-sector BIOS image with two blank save records")
+    print("check: eighteen-sector BIOS image with two blank save records")
     return 0
 
 

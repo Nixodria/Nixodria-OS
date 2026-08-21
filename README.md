@@ -1,10 +1,10 @@
 # Nixodria OS
 
 Nixodria OS is a tiny bootable x86 command-line operating system. Its first
-512-byte BIOS sector loads a three-sector real-mode kernel. Ten more sectors
+512-byte BIOS sector loads a seven-sector real-mode kernel. Ten more sectors
 hold two alternating copies of the text editor's durable document, producing a
-7 KiB image. The kernel starts a serial console without a general filesystem,
-processes, or networking.
+9 KiB, 18-sector image. The kernel starts a serial console without a general
+filesystem, processes, or networking.
 
 ## Commands
 
@@ -26,6 +26,7 @@ editing remains correct across terminal line wraps.
 
 - Control-X — exit to the shell
 - Control-S — save the document to disk
+- Control-R — run the current document as a BASIC program
 - Control-L — clear the entire document
 
 The editor holds one document of up to 2,047 bytes. Control-S writes the current
@@ -37,6 +38,47 @@ save is interrupted or its newest record is corrupt, the editor recovers the
 previous verified version. A failed disk write is reported instead of being
 presented as a successful save. The inactive record intentionally retains that
 one previous version for recovery.
+
+Control-R runs the document currently in memory, including unsaved edits; it
+does not save implicitly. Program output is shown on the serial console, and a
+syntax or runtime error stops the program and returns safely to the editor
+without changing its source.
+
+## BASIC
+
+Nixodria implements a deliberately small, case-insensitive, line-numbered BASIC
+subset. Every statement starts with a decimal line number from 0 through 65535.
+Supported statements are:
+
+- `PRINT "text"` or `PRINT expression`
+- `LET A = expression`, using one-letter variables `A` through `Z`
+- `IF expression = expression THEN line`, with `<` and `>` also supported
+- `GOTO line`
+- `REM` followed by a comment
+- `END`
+
+Expressions contain signed 16-bit integer literals or variables joined with
+`+` and `-`. Variables start at zero and are reset each time Control-R starts a
+program. Lines execute in the order written, and `GOTO` or `THEN` uses the
+first matching line number. Execution stops with a runtime error after 10,000
+statements, so an accidental infinite loop returns control to the editor.
+
+For example:
+
+```basic
+10 REM COUNT DOWN
+20 LET A = 3
+30 PRINT "COUNT"
+40 PRINT A
+50 LET A = A - 1
+60 IF A > 0 THEN 40
+70 END
+```
+
+The editor stores one program of at most 2,047 bytes. This BASIC subset does not
+provide multiple files, interactive input, string variables, `FOR`/`NEXT`,
+arrays, functions, multiplication, division, parentheses, or multiple
+statements on one line.
 
 ## Build and run
 
