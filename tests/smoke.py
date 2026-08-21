@@ -67,6 +67,8 @@ class QemuSession:
             "stdio",
             "-monitor",
             "none",
+            "-nic",
+            "none",
             "-no-reboot",
             "-no-shutdown",
         ]
