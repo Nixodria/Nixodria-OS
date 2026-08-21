@@ -6,7 +6,9 @@ import sys
 
 
 SECTOR_SIZE = 512
-IMAGE_SECTORS = 3
+SYSTEM_SECTORS = 4
+STORAGE_SECTORS = 10
+IMAGE_SECTORS = SYSTEM_SECTORS + STORAGE_SECTORS
 IMAGE_SIZE = SECTOR_SIZE * IMAGE_SECTORS
 
 
@@ -28,14 +30,22 @@ def main() -> int:
         b"Nixodria OS",
         b"nix> ",
         b"Nixodria Editor",
-        b"Ctrl-X exit",
+        b"Ctrl-S save",
+        b"Saved.",
+        b"Save failed.",
+        b"NIX2",
         b"Disk error",
     )
-    if any(value not in data for value in required_strings):
+    system = data[: SYSTEM_SECTORS * SECTOR_SIZE]
+    storage = data[SYSTEM_SECTORS * SECTOR_SIZE :]
+    if any(value not in system for value in required_strings):
         print("check: expected console strings are missing", file=sys.stderr)
         return 1
+    if any(storage):
+        print("check: newly built persistent storage is not blank", file=sys.stderr)
+        return 1
 
-    print("check: three-sector BIOS image with loader signature 55 aa")
+    print("check: fourteen-sector BIOS image with two blank save records")
     return 0
 
 
