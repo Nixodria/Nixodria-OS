@@ -94,7 +94,7 @@ include the relevant version output in your issue or pull request.
 - `src/boot.asm` contains the boot sector, real-mode kernel, shell, editor,
   durable storage implementation, and BASIC interpreter.
 - `tools/prepare_runtime_image.py` creates or safely refreshes the writable
-  runtime image while preserving its storage sectors.
+  runtime image while preserving its file snapshots.
 - `tests/check_image.py` validates the assembled image's static invariants.
 - `tests/check_runtime_image.py` checks runtime-image creation, migration, and
   failure safety.
@@ -102,7 +102,7 @@ include the relevant version output in your issue or pull request.
   its serial console.
 - `build/nixodria.img` is the reproducible blank build output.
 - `.nixodria/nixodria.img` is the local writable runtime image and can contain a
-  user's saved document.
+  user's saved files.
 
 `build/`, `.nixodria/`, and Python cache directories are generated locally and
 must not be committed.
@@ -111,10 +111,11 @@ must not be committed.
 
 ### Preserve image and boot invariants
 
-The current image is 18 sectors: one 512-byte BIOS boot sector, a seven-sector
-kernel, and two five-sector save records. The first sector must retain its
-`55 aa` BIOS signature, and a freshly built image must have blank storage
-sectors.
+The current image is a standard 1.44 MiB floppy: one 512-byte BIOS boot sector,
+a ten-sector kernel, and two 33-sector file snapshots. Each snapshot contains
+one directory sector and eight fixed four-sector file slots. The first sector
+must retain its `55 aa` BIOS signature, and a freshly built image must have
+blank snapshot and unused sectors.
 
 If a change intentionally alters the image layout, update every affected
 constant and assumption together in:
@@ -125,6 +126,7 @@ constant and assumption together in:
 - `tests/check_runtime_image.py`
 - `tests/smoke.py`
 - `README.md`
+- `CONTRIBUTING.md`
 
 Preserve compatibility with existing runtime images when the layout changes, or
 document and test an intentional migration path.
@@ -134,9 +136,9 @@ make a larger image build.
 
 ### Protect persistent data
 
-Normal rebuilds replace only the runtime image's system sectors. They must not
-overwrite its saved document. `make clean` intentionally removes `build/` but
-leaves `.nixodria/nixodria.img` intact.
+Normal rebuilds replace only the runtime image's immutable sectors. They must
+not overwrite either file snapshot. `make clean` intentionally removes
+`build/` but leaves `.nixodria/nixodria.img` intact.
 
 Changes to runtime-image handling or editor saves must remain fail-closed:
 malformed images and symbolic links must not be overwritten, runtime files must

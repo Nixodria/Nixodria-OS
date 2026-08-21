@@ -5,17 +5,30 @@ COM1            equ 0x3f8
 SHELL_BUFFER    equ 0x0600
 SHELL_CAPACITY  equ 32
 BASIC_VARS      equ 0x0800
-STORAGE_HEADER_A equ 0x8c00
-STORAGE_HEADER_B equ 0x8e00
-EDITOR_BUFFER   equ 0x9000
+STORAGE_HEADER_A equ 0x9400
+STORAGE_HEADER_B equ 0x9600
+FILES_HEADER    equ 0x9800
+HEADER_BACKUP   equ 0x9a00
+EDITOR_BUFFER   equ 0x9c00
 EDITOR_CAPACITY equ 2048
-KERNEL_SECTORS  equ 7
-STORAGE_SECTOR_A equ KERNEL_SECTORS + 2
-STORAGE_SLOT_SECTORS equ 5
-STORAGE_SECTOR_B equ STORAGE_SECTOR_A + STORAGE_SLOT_SECTORS
+FILES_DATA      equ 0xa400
+FILE_BACKUP     equ 0xe400
+KERNEL_SECTORS  equ 10
+STORAGE_LBA_A   equ KERNEL_SECTORS + 1
+STORAGE_SLOT_SECTORS equ 33
+STORAGE_LBA_B   equ STORAGE_LBA_A + STORAGE_SLOT_SECTORS
 STORAGE_SECTORS equ STORAGE_SLOT_SECTORS * 2
-IMAGE_SECTORS   equ 1 + KERNEL_SECTORS + STORAGE_SECTORS
-STORAGE_MAGIC   equ 0x3258494e        ; "NIX2" in little-endian order
+IMAGE_SECTORS   equ 2880
+STORAGE_MAGIC   equ 0x3358494e        ; "NIX3" in little-endian order
+LEGACY_STORAGE_MAGIC equ 0x3258494e   ; "NIX2" in little-endian order
+FILE_COUNT_MAX  equ 8
+FILE_NAME_SIZE  equ 13
+FILE_ENTRY_SIZE equ 18
+FILE_ENTRIES    equ 8
+FILE_LENGTH     equ 14
+FILE_CHECKSUM   equ 16
+FILES_HEADER_CRC equ FILE_ENTRIES + FILE_COUNT_MAX * FILE_ENTRY_SIZE
+FILES_DATA_SECTORS equ FILE_COUNT_MAX * 4
 
 ; The BIOS loads this first sector at 0000:7c00. Load the small real-mode
 ; kernel from the following sectors, then transfer control to it.
@@ -197,6 +210,16 @@ shell:
     jc command_edit
 
     mov si, SHELL_BUFFER
+    mov di, cmd_edit_file
+    call prefix_equal
+    jc command_edit_file
+
+    mov si, SHELL_BUFFER
+    mov di, cmd_files
+    call strings_equal
+    jc command_files
+
+    mov si, SHELL_BUFFER
     mov di, cmd_clear
     call strings_equal
     jc command_clear
@@ -226,6 +249,19 @@ command_help:
     jmp shell
 
 command_edit:
+    mov si, default_filename
+    jmp command_edit_name
+
+command_edit_file:
+    ; prefix_equal leaves SI at the requested filename.
+command_edit_name:
+    call filename_normalize
+    jc .valid
+    mov si, invalid_filename
+    call print_string
+    jmp shell
+.valid:
+    call file_open
     mov cx, bx
     mov di, EDITOR_BUFFER
     add di, cx
@@ -309,9 +345,12 @@ command_edit:
     jmp .read
 
 .save:
-    call storage_save
+    call file_save
     mov byte [editor_status], 1
     jnc .saved
+    mov byte [editor_status], 2
+    cmp byte [save_error], 1
+    jne .saved
     inc byte [editor_status]
 .saved:
     call editor_redraw
@@ -341,14 +380,23 @@ editor_redraw:
     call print_string
     mov si, editor_header
     call print_string
+    mov si, current_filename
+    call print_string
+    mov si, editor_controls
+    call print_string
     cmp byte [editor_status], 1
     jne .not_saved
     mov si, saved
     jmp .status
 .not_saved:
     cmp byte [editor_status], 2
-    jne .no_status
+    jne .not_failed
     mov si, save_failed
+    jmp .status
+.not_failed:
+    cmp byte [editor_status], 3
+    jne .no_status
+    mov si, storage_full
 .status:
     call print_string
 .no_status:
@@ -359,16 +407,166 @@ editor_redraw:
     mov byte [editor_status], 0
     ret
 
-; Read both save-record headers, try the newest valid record first, and fall
-; back to the other slot if its payload is damaged or incomplete.
+command_files:
+    cmp byte [FILES_HEADER + 6], 0
+    jne .list
+    mov si, no_files
+    call print_string
+    jmp shell
+.list:
+    mov si, files_heading
+    call print_string
+    xor ch, ch
+    mov cl, [FILES_HEADER + 6]
+    mov di, FILES_HEADER + FILE_ENTRIES
+.next:
+    mov si, di
+    call print_string
+    mov si, newline
+    call print_string
+    add di, FILE_ENTRY_SIZE
+    loop .next
+    jmp shell
+
+; Normalize a short filename from DS:SI into current_filename. Names are
+; case-insensitive and contain 1-12 letters, digits, dots, underscores, or
+; hyphens. Carry is clear for an invalid or overlong name.
+filename_normalize:
+    push ax
+    push cx
+    push di
+    push si
+    xor ax, ax
+    mov di, current_filename
+    mov cx, FILE_NAME_SIZE
+    rep stosb
+    pop si
+    xor cx, cx
+    mov di, current_filename
+.next:
+    lodsb
+    test al, al
+    jz .done
+    cmp cx, FILE_NAME_SIZE - 1
+    jae .invalid
+    cmp al, 'a'
+    jb .not_lower
+    cmp al, 'z'
+    ja .not_lower
+    sub al, 'a' - 'A'
+.not_lower:
+    cmp al, 'A'
+    jb .not_letter
+    cmp al, 'Z'
+    jbe .store
+.not_letter:
+    cmp al, '0'
+    jb .punctuation
+    cmp al, '9'
+    jbe .store
+.punctuation:
+    cmp al, '.'
+    je .store
+    cmp al, '_'
+    je .store
+    cmp al, '-'
+    jne .invalid
+.store:
+    stosb
+    inc cx
+    jmp .next
+.done:
+    test cx, cx
+    jz .invalid
+    mov byte [di], 0
+    stc
+    jmp .restore
+.invalid:
+    clc
+.restore:
+    pop di
+    pop cx
+    pop ax
+    ret
+
+; Find current_filename in the compact directory. Carry is set with AL holding
+; its zero-based slot and DI pointing at the entry.
+file_find:
+    mov byte [find_index], 0
+    mov di, FILES_HEADER + FILE_ENTRIES
+.next:
+    mov al, [find_index]
+    cmp al, [FILES_HEADER + 6]
+    jae .missing
+    mov bx, di
+    mov si, current_filename
+    call strings_equal
+    jc .found
+    mov di, bx
+    add di, FILE_ENTRY_SIZE
+    inc byte [find_index]
+    jmp .next
+.found:
+    mov di, bx
+    mov al, [find_index]
+    stc
+    ret
+.missing:
+    clc
+    ret
+
+; Open a saved file into the editor, or start a blank unsaved buffer when its
+; normalized name is not yet present. BX returns the document length.
+file_open:
+    call file_find
+    jnc .new
+    mov [current_file_index], al
+    mov bx, [di + FILE_LENGTH]
+    xor ah, ah
+    shl ax, 11
+    mov si, FILES_DATA
+    add si, ax
+    mov cx, bx
+    mov di, EDITOR_BUFFER
+    rep movsb
+    mov byte [di], 0
+    ret
+.new:
+    mov byte [current_file_index], 0xff
+    xor bx, bx
+    mov byte [EDITOR_BUFFER], 0
+    ret
+
+; Initialize an empty in-memory directory and all eight fixed-size file slots.
+files_initialize:
+    push ax
+    push cx
+    push di
+    xor ax, ax
+    mov di, FILES_HEADER
+    mov cx, 256
+    rep stosw
+    mov dword [FILES_HEADER], STORAGE_MAGIC
+    mov di, FILES_DATA
+    mov cx, FILE_COUNT_MAX * (EDITOR_CAPACITY / 2)
+    rep stosw
+    mov byte [current_file_index], 0xff
+    pop di
+    pop cx
+    pop ax
+    ret
+
+; Read both snapshot headers, try the newest structurally valid snapshot first,
+; and fall back to the other copy if any named file has a damaged payload.
 storage_load:
+    call files_initialize
     mov byte [active_slot], 0xff
     mov word [active_generation], 0
     mov byte [slot_a_valid], 0
     mov byte [slot_b_valid], 0
 
     mov bx, STORAGE_HEADER_A
-    mov cl, STORAGE_SECTOR_A
+    mov cl, STORAGE_LBA_A
     mov al, 1
     call disk_read
     jc .read_b
@@ -379,7 +577,7 @@ storage_load:
 
 .read_b:
     mov bx, STORAGE_HEADER_B
-    mov cl, STORAGE_SECTOR_B
+    mov cl, STORAGE_LBA_B
     mov al, 1
     call disk_read
     jc .choose
@@ -393,38 +591,32 @@ storage_load:
     je .only_b
     cmp byte [slot_b_valid], 0
     je .only_a
-
     mov ax, [STORAGE_HEADER_A + 4]
     sub ax, [STORAGE_HEADER_B + 4]
     cmp ax, 0x8000
     jbe .a_first
-
 .b_first:
     call storage_try_b
     jnc .loaded_b
     call storage_try_a
     jnc .loaded_a
     jmp .empty
-
 .a_first:
     call storage_try_a
     jnc .loaded_a
     call storage_try_b
     jnc .loaded_b
     jmp .empty
-
 .only_a:
     call storage_try_a
     jnc .loaded_a
     jmp .empty
-
 .only_b:
     cmp byte [slot_b_valid], 0
     je .empty
     call storage_try_b
     jnc .loaded_b
     jmp .empty
-
 .loaded_a:
     mov byte [active_slot], 0
     mov ax, [STORAGE_HEADER_A + 4]
@@ -434,45 +626,136 @@ storage_load:
     mov ax, [STORAGE_HEADER_B + 4]
 .loaded:
     mov [active_generation], ax
-    ret
-
-.empty:
     xor bx, bx
-    mov byte [EDITOR_BUFFER], 0
+    ret
+.empty:
+    call files_initialize
+    xor bx, bx
     ret
 
 storage_try_a:
     mov di, STORAGE_HEADER_A
-    mov cl, STORAGE_SECTOR_A + 1
+    mov cl, STORAGE_LBA_A + 1
     jmp storage_try_slot
 
 storage_try_b:
     mov di, STORAGE_HEADER_B
-    mov cl, STORAGE_SECTOR_B + 1
+    mov cl, STORAGE_LBA_B + 1
 
-; Try the payload described by DI from disk sector CL. Carry is clear only
-; after its CRC is verified and BX contains the validated document length.
+; Load either a NIX3 multi-file snapshot or a legacy NIX2 document. Legacy
+; records are imported in memory as UNTITLED.TXT and converted on the next save.
 storage_try_slot:
-    mov bx, EDITOR_BUFFER
+    cmp dword [di], LEGACY_STORAGE_MAGIC
+    je .legacy
+    mov bx, FILES_DATA
+    mov si, FILES_DATA_SECTORS
+    call storage_read_payload
+    jc .invalid
+    call storage_validate_files
+    jc .invalid
+    mov si, di
+    mov di, FILES_HEADER
+    mov cx, 256
+    rep movsw
+    clc
+    ret
+.legacy:
+    mov bx, FILES_DATA
+    mov si, 4
     call storage_read_payload
     jc .invalid
     mov cx, [di + 6]
-    mov si, EDITOR_BUFFER
+    mov si, FILES_DATA
     call storage_checksum
     cmp dx, [di + 8]
     jne .invalid
-    mov bx, cx
-    mov byte [EDITOR_BUFFER + bx], 0
+    call storage_import_legacy
     clc
     ret
 .invalid:
     stc
     ret
 
-; A header is valid only if its format, bounded length, and header CRC match.
+; Validate a candidate NIX3 snapshot's entry names, lengths, and per-file CRCs.
+; DI remains the candidate header address for the caller.
+storage_validate_files:
+    mov [validation_header], di
+    mov byte [validation_index], 0
+.next:
+    mov al, [validation_index]
+    cmp al, [di + 6]
+    jae .valid
+    call storage_candidate_entry
+    cmp byte [bx], 0
+    je .invalid
+    push bx
+    mov si, bx
+    mov cx, FILE_NAME_SIZE
+.name:
+    lodsb
+    test al, al
+    jz .name_valid
+    loop .name
+    pop bx
+    jmp .invalid
+.name_valid:
+    pop bx
+    cmp word [bx + FILE_LENGTH], EDITOR_CAPACITY - 1
+    ja .invalid
+    mov al, [validation_index]
+    call storage_data_address
+    mov cx, [bx + FILE_LENGTH]
+    call storage_checksum
+    cmp dx, [bx + FILE_CHECKSUM]
+    jne .invalid
+    inc byte [validation_index]
+    mov di, [validation_header]
+    jmp .next
+.valid:
+    mov di, [validation_header]
+    clc
+    ret
+.invalid:
+    mov di, [validation_header]
+    stc
+    ret
+
+; Return BX pointing at entry AL in the candidate header saved above.
+storage_candidate_entry:
+    push ax
+    xor ah, ah
+    mov bl, FILE_ENTRY_SIZE
+    mul bl
+    mov bx, ax
+    add bx, [validation_header]
+    add bx, FILE_ENTRIES
+    pop ax
+    ret
+
+; Return SI pointing at fixed data slot AL.
+storage_data_address:
+    xor ah, ah
+    shl ax, 11
+    mov si, FILES_DATA
+    add si, ax
+    ret
+
+; A header is valid only if its versioned bounds and header CRC match.
 storage_header_valid:
+    cmp dword [si], LEGACY_STORAGE_MAGIC
+    je .legacy
     cmp dword [si], STORAGE_MAGIC
     jne .invalid
+    cmp byte [si + 6], FILE_COUNT_MAX
+    ja .invalid
+    mov di, si
+    mov cx, FILES_HEADER_CRC
+    call storage_checksum
+    cmp dx, [di + FILES_HEADER_CRC]
+    jne .invalid
+    clc
+    ret
+.legacy:
     cmp word [si + 6], EDITOR_CAPACITY - 1
     ja .invalid
     mov di, si
@@ -486,9 +769,169 @@ storage_header_valid:
     stc
     ret
 
-; Save into the slot opposite the active record. The target header is first
-; invalidated, then four payload sectors are written, and the verified header
-; is committed last. A failed/interrupted save leaves the other slot untouched.
+storage_import_legacy:
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+    mov ax, [di + 4]
+    mov bx, [di + 6]
+    mov dx, [di + 8]
+    mov di, FILES_HEADER
+    xor cx, cx
+    mov cx, 256
+    xor si, si
+    xchg ax, si
+    xor ax, ax
+    rep stosw
+    xchg ax, si
+    mov dword [FILES_HEADER], STORAGE_MAGIC
+    mov [FILES_HEADER + 4], ax
+    mov byte [FILES_HEADER + 6], 1
+    mov si, default_filename
+    mov di, FILES_HEADER + FILE_ENTRIES
+    mov cx, FILE_NAME_SIZE
+    rep movsb
+    mov [FILES_HEADER + FILE_ENTRIES + FILE_LENGTH], bx
+    mov [FILES_HEADER + FILE_ENTRIES + FILE_CHECKSUM], dx
+    mov di, FILES_DATA
+    add di, bx
+    mov cx, FILE_COUNT_MAX * EDITOR_CAPACITY
+    sub cx, bx
+    xor ax, ax
+    rep stosb
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+; Save the editor into its named fixed slot. Directory and data changes are
+; rolled back in RAM if the inactive disk snapshot cannot be committed.
+file_save:
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+    push bp
+    mov [save_length], cx
+    mov byte [save_error], 0
+    mov al, [current_file_index]
+    mov [save_old_index], al
+    mov si, FILES_HEADER
+    mov di, HEADER_BACKUP
+    mov cx, 256
+    rep movsw
+
+    call file_find
+    jc .have_slot
+    mov al, [FILES_HEADER + 6]
+    cmp al, FILE_COUNT_MAX
+    jae .full
+    mov [save_file_index], al
+    inc byte [FILES_HEADER + 6]
+    call files_entry_address
+    push di
+    xor ax, ax
+    mov cx, FILE_ENTRY_SIZE
+    rep stosb
+    pop di
+    mov si, current_filename
+    mov cx, FILE_NAME_SIZE
+    rep movsb
+    jmp .backup_data
+.have_slot:
+    mov [save_file_index], al
+.backup_data:
+    mov al, [save_file_index]
+    call files_data_address
+    mov si, di
+    mov di, FILE_BACKUP
+    mov cx, EDITOR_CAPACITY / 2
+    rep movsw
+
+    mov al, [save_file_index]
+    call files_data_address
+    mov si, EDITOR_BUFFER
+    mov cx, [save_length]
+    rep movsb
+    mov cx, EDITOR_CAPACITY
+    sub cx, [save_length]
+    xor ax, ax
+    rep stosb
+
+    mov al, [save_file_index]
+    call files_entry_address
+    mov ax, [save_length]
+    mov [di + FILE_LENGTH], ax
+    mov cx, ax
+    mov si, EDITOR_BUFFER
+    call storage_checksum
+    mov [di + FILE_CHECKSUM], dx
+    call storage_save
+    jc .disk_failed
+    mov al, [save_file_index]
+    mov [current_file_index], al
+    clc
+    jmp .restore
+.disk_failed:
+    mov byte [save_error], 2
+    call file_save_rollback
+    stc
+    jmp .restore
+.full:
+    mov byte [save_error], 1
+    stc
+.restore:
+    pop bp
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+file_save_rollback:
+    mov si, HEADER_BACKUP
+    mov di, FILES_HEADER
+    mov cx, 256
+    rep movsw
+    mov al, [save_file_index]
+    call files_data_address
+    mov si, FILE_BACKUP
+    mov cx, EDITOR_CAPACITY / 2
+    rep movsw
+    mov al, [save_old_index]
+    mov [current_file_index], al
+    ret
+
+; Return DI pointing at directory entry AL in the active header.
+files_entry_address:
+    xor ah, ah
+    mov bl, FILE_ENTRY_SIZE
+    mul bl
+    mov di, FILES_HEADER + FILE_ENTRIES
+    add di, ax
+    ret
+
+; Return DI pointing at fixed data slot AL.
+files_data_address:
+    xor ah, ah
+    shl ax, 11
+    mov di, FILES_DATA
+    add di, ax
+    ret
+
+; Commit the complete directory and eight data slots into the snapshot opposite
+; the active one. The zero header invalidates the target before its data moves;
+; the verified NIX3 header is written last as the atomic commit record.
 storage_save:
     push ax
     push bx
@@ -497,77 +940,64 @@ storage_save:
     push si
     push di
     push bp
-
     cmp byte [active_slot], 0
     je .target_b
     mov word [save_header], STORAGE_HEADER_A
-    mov byte [save_header_sector], STORAGE_SECTOR_A
+    mov byte [save_header_sector], STORAGE_LBA_A
     mov byte [save_target], 0
-    jmp .prepare
+    jmp .invalidate
 .target_b:
     mov word [save_header], STORAGE_HEADER_B
-    mov byte [save_header_sector], STORAGE_SECTOR_B
+    mov byte [save_header_sector], STORAGE_LBA_B
     mov byte [save_target], 1
-
-.prepare:
-    mov [save_length], cx
+.invalidate:
     mov di, [save_header]
     xor ax, ax
     mov cx, 256
     rep stosw
-
-    ; Invalidate the target on disk before replacing any of its payload.
     mov bx, [save_header]
     mov cl, [save_header_sector]
     mov al, 1
     call disk_write
     jc .failed
 
-    ; Do not retain previously deleted text in unused on-disk bytes.
-    mov cx, [save_length]
-    mov di, EDITOR_BUFFER
-    add di, cx
-    mov ax, EDITOR_CAPACITY
-    sub ax, cx
-    xchg ax, cx
-    xor ax, ax
-    rep stosb
-
+    mov si, FILES_HEADER
     mov di, [save_header]
-    mov dword [di], STORAGE_MAGIC
+    mov cx, 256
+    rep movsw
+    mov dword [di - 512], STORAGE_MAGIC
     mov ax, [active_generation]
     cmp byte [active_slot], 0xff
     je .first_generation
     inc ax
 .first_generation:
-    mov [di + 4], ax
-    mov ax, [save_length]
-    mov [di + 6], ax
-    mov cx, ax
-    mov si, EDITOR_BUFFER
+    mov bx, [save_header]
+    mov [bx + 4], ax
+    mov si, bx
+    mov cx, FILES_HEADER_CRC
     call storage_checksum
-    mov [di + 8], dx
-    mov cx, 10
-    mov si, di
-    call storage_checksum
-    mov [di + 10], dx
+    mov [bx + FILES_HEADER_CRC], dx
 
-    mov bx, EDITOR_BUFFER
+    mov bx, FILES_DATA
     mov cl, [save_header_sector]
     inc cl
+    mov si, FILES_DATA_SECTORS
     call storage_write_payload
     jc .failed
-
     mov bx, [save_header]
     mov cl, [save_header_sector]
     mov al, 1
     call disk_write
     jc .failed
 
+    mov si, [save_header]
+    mov di, FILES_HEADER
+    mov cx, 256
+    rep movsw
     mov al, [save_target]
     mov [active_slot], al
-    mov di, [save_header]
-    mov ax, [di + 4]
+    mov bx, [save_header]
+    mov ax, [bx + 4]
     mov [active_generation], ax
     clc
     jmp .restore
@@ -583,11 +1013,8 @@ storage_save:
     pop ax
     ret
 
-; Transfer the four payload sectors individually so retries never depend on a
-; BIOS supporting multi-sector floppy operations.
+; Transfer SI payload sectors individually. CL is a zero-based floppy LBA.
 storage_read_payload:
-    push si
-    mov si, 4
 .next:
     mov al, 1
     call disk_read
@@ -597,16 +1024,12 @@ storage_read_payload:
     dec si
     jnz .next
     clc
-    jmp .done
+    ret
 .failed:
     stc
-.done:
-    pop si
     ret
 
 storage_write_payload:
-    push si
-    mov si, 4
 .next:
     mov al, 1
     call disk_write
@@ -616,11 +1039,9 @@ storage_write_payload:
     dec si
     jnz .next
     clc
-    jmp .done
+    ret
 .failed:
     stc
-.done:
-    pop si
     ret
 
 disk_read:
@@ -630,8 +1051,8 @@ disk_read:
 disk_write:
     mov ah, 0x03
 
-; Transfer AL sectors at cylinder 0, head 0, sector CL with three retries.
-; The request is saved in resident variables because BIOS calls may clobber AX.
+; Convert zero-based LBA in CL to 1.44MB-floppy CHS (18 sectors, two heads)
+; and transfer AL sectors with three retries.
 disk_transfer:
     mov [disk_request], ax
     mov [disk_buffer], bx
@@ -648,11 +1069,19 @@ disk_transfer:
     xor ah, ah
     mov dl, [boot_drive]
     int 0x13
+    xor ax, ax
+    mov al, [disk_sector]
+    mov bl, 18
+    div bl
+    mov cl, ah
+    inc cl
+    xor ah, ah
+    mov dh, al
+    and dh, 1
+    shr al, 1
+    mov ch, al
     mov ax, [disk_request]
     mov bx, [disk_buffer]
-    xor cx, cx
-    mov cl, [disk_sector]
-    xor dh, dh
     mov dl, [boot_drive]
     int 0x13
     jnc .succeeded
@@ -1248,15 +1677,22 @@ prompt         db 'nix> ', 0
 newline        db 13, 10, 0
 erase          db 8, ' ', 8, 0
 unknown        db 'Unknown command.', 13, 10, 0
-help_text      db 'help edit clear echo <text> reboot halt', 13, 10, 0
-editor_header  db 'Nixodria Editor', 13, 10, 'Ctrl-S save | Ctrl-R run | Ctrl-X exit | Ctrl-L clear', 13, 10, 0
+help_text      db 'help files edit [filename] clear echo <text> reboot halt', 13, 10, 0
+editor_header  db 'Nixodria Editor: ', 0
+editor_controls db 13, 10, 'Ctrl-S save | Ctrl-R run | Ctrl-X exit | Ctrl-L clear', 13, 10, 0
 clear_sequence db 27, '[2J', 27, '[H', 0
 saved          db 'Saved.', 13, 10, 0
 save_failed    db 'Save failed.', 13, 10, 0
+storage_full   db 'Storage full.', 13, 10, 0
+invalid_filename db 'Invalid filename.', 13, 10, 0
+files_heading  db 'Files:', 13, 10, 0
+no_files       db 'No files.', 13, 10, 0
 rebooting      db 'Rebooting...', 13, 10, 0
 halted         db 'Halted.', 13, 10, 0
 cmd_help       db 'help', 0
 cmd_edit       db 'edit', 0
+cmd_edit_file  db 'edit ', 0
+cmd_files      db 'files', 0
 cmd_clear      db 'clear', 0
 cmd_reboot     db 'reboot', 0
 cmd_halt       db 'halt', 0
@@ -1272,7 +1708,11 @@ basic_kw_goto  db 'goto', 0
 basic_kw_rem   db 'rem', 0
 basic_kw_end   db 'end', 0
 basic_kw_then  db 'then', 0
+default_filename db 'UNTITLED.TXT', 0
+current_filename times FILE_NAME_SIZE db 0
 editor_status  db 0
+current_file_index db 0xff
+find_index     db 0
 active_slot    db 0xff
 active_generation dw 0
 slot_a_valid   db 0
@@ -1281,6 +1721,11 @@ save_header    dw 0
 save_length    dw 0
 save_header_sector db 0
 save_target    db 0
+save_error     db 0
+save_old_index db 0xff
+save_file_index db 0
+validation_header dw 0
+validation_index db 0
 disk_request   dw 0
 disk_buffer    dw 0
 disk_sector    db 0
@@ -1292,5 +1737,5 @@ basic_operator db 0
 ; Keep executable code inside the sectors loaded by the first-stage loader.
 times (1 + KERNEL_SECTORS) * 512 - ($ - $$) db 0
 
-; A freshly assembled image contains two blank five-sector save records.
-times STORAGE_SECTORS * 512 db 0
+; Pad to a standard 1.44 MiB floppy. Both save snapshots start blank.
+times IMAGE_SECTORS * 512 - ($ - $$) db 0

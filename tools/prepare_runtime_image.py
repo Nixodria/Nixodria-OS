@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Refresh boot code and migrate or preserve Nixodria's document sectors."""
+"""Refresh boot code and migrate or preserve Nixodria's file snapshots."""
 
 import os
 from pathlib import Path
@@ -8,13 +8,25 @@ import tempfile
 
 
 SECTOR_SIZE = 512
-SYSTEM_SECTORS = 8
-STORAGE_SECTORS = 10
-LEGACY_SYSTEM_SECTORS = 4
+IMAGE_SECTORS = 2880
+SYSTEM_SECTORS = 11
+SNAPSHOT_SECTORS = 33
+STORAGE_SECTORS = SNAPSHOT_SECTORS * 2
+LEGACY_SYSTEM_SECTORS = (8, 4)
+LEGACY_STORAGE_SECTORS = 10
+LEGACY_SLOT_SECTORS = 5
+IMAGE_SIZE = SECTOR_SIZE * IMAGE_SECTORS
 SYSTEM_SIZE = SECTOR_SIZE * SYSTEM_SECTORS
+SNAPSHOT_SIZE = SECTOR_SIZE * SNAPSHOT_SECTORS
 STORAGE_SIZE = SECTOR_SIZE * STORAGE_SECTORS
-IMAGE_SIZE = SECTOR_SIZE * (SYSTEM_SECTORS + STORAGE_SECTORS)
-LEGACY_IMAGE_SIZE = SECTOR_SIZE * (LEGACY_SYSTEM_SECTORS + STORAGE_SECTORS)
+STORAGE_OFFSET = SYSTEM_SIZE
+STORAGE_END = STORAGE_OFFSET + STORAGE_SIZE
+LEGACY_STORAGE_SIZE = SECTOR_SIZE * LEGACY_STORAGE_SECTORS
+LEGACY_SLOT_SIZE = SECTOR_SIZE * LEGACY_SLOT_SECTORS
+LEGACY_IMAGE_SIZES = tuple(
+    SECTOR_SIZE * (system_sectors + LEGACY_STORAGE_SECTORS)
+    for system_sectors in LEGACY_SYSTEM_SECTORS
+)
 
 
 class ImageError(RuntimeError):
@@ -41,15 +53,16 @@ def read_runtime_image(path: Path) -> tuple[bytes, bool]:
     except OSError as error:
         raise ImageError(f"cannot read runtime image {path}: {error}") from error
 
-    if len(data) not in (IMAGE_SIZE, LEGACY_IMAGE_SIZE):
+    if len(data) != IMAGE_SIZE and len(data) not in LEGACY_IMAGE_SIZES:
+        legacy_sizes = " or ".join(str(size) for size in LEGACY_IMAGE_SIZES)
         raise ImageError(
             f"runtime image {path} is {len(data)} bytes; expected {IMAGE_SIZE} "
-            f"or legacy {LEGACY_IMAGE_SIZE}"
+            f"or legacy {legacy_sizes}"
         )
     if data[SECTOR_SIZE - 2 : SECTOR_SIZE] != b"\x55\xaa":
         raise ImageError(f"runtime image {path} has no BIOS signature")
 
-    return data, len(data) == LEGACY_IMAGE_SIZE
+    return data, len(data) in LEGACY_IMAGE_SIZES
 
 
 def replace_atomically(path: Path, data: bytes) -> None:
@@ -82,17 +95,31 @@ def prepare_runtime_image(template: Path, runtime: Path) -> str:
     runtime_data: bytes | None = None
     if runtime.exists():
         runtime_data, legacy = read_runtime_image(runtime)
-        combined = template_data[:SYSTEM_SIZE] + runtime_data[-STORAGE_SIZE:]
+        combined_bytes = bytearray(template_data)
         if legacy:
-            action = "migrated legacy image and preserved saved text in"
+            legacy_storage = runtime_data[-LEGACY_STORAGE_SIZE:]
+            combined_bytes[
+                STORAGE_OFFSET : STORAGE_OFFSET + LEGACY_SLOT_SIZE
+            ] = legacy_storage[:LEGACY_SLOT_SIZE]
+            combined_bytes[
+                STORAGE_OFFSET + SNAPSHOT_SIZE :
+                STORAGE_OFFSET + SNAPSHOT_SIZE + LEGACY_SLOT_SIZE
+            ] = legacy_storage[LEGACY_SLOT_SIZE:]
+            action = "migrated legacy image and preserved saved files in"
         else:
-            action = "updated system sectors and preserved saved text in"
+            combined_bytes[STORAGE_OFFSET:STORAGE_END] = runtime_data[
+                STORAGE_OFFSET:STORAGE_END
+            ]
+            action = "updated system sectors and preserved saved files in"
+        combined = bytes(combined_bytes)
     else:
         combined = template_data
         action = "created"
 
     if runtime_data is None or combined != runtime_data:
         replace_atomically(runtime, combined)
+    else:
+        os.chmod(runtime, 0o600)
     return f"runtime: {action} {runtime}"
 
 

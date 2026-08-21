@@ -1,15 +1,17 @@
 # Nixodria OS
 
 Nixodria OS is a bootable x86 command-line operating system. Its first
-512-byte BIOS sector loads a seven-sector real-mode kernel. Ten more sectors
-hold two alternating copies of the text editor's durable document, producing a
-9 KiB, 18-sector image. The kernel starts a serial console without a general
-filesystem, processes, or networking.
+512-byte BIOS sector loads a ten-sector real-mode kernel from a standard
+1.44 MiB floppy image. A small flat file store holds up to eight named text or
+BASIC files in two alternating recovery snapshots. The kernel starts a serial
+console without processes, networking, or a general-purpose filesystem.
 
 ## Commands
 
 - `help` — list commands
-- `edit` — open the persistent text editor
+- `files` — list saved files by name
+- `edit <filename>` — open an existing file or start a new one
+- `edit` — open `UNTITLED.TXT` for compatibility
 - `clear` — clear the terminal
 - `echo <text>` — print text
 - `reboot` — restart the OS through the BIOS
@@ -19,25 +21,28 @@ The shell input line holds 31 characters and supports Backspace.
 
 ## Text editor
 
-Run `edit` to open a 2 KiB scratchpad. Type at the end of the document, use
-Enter for a new line, and use Backspace to remove text. Both the BS and DEL
-terminal codes are accepted as Backspace. The editor redraws after deletion so
-editing remains correct across terminal line wraps.
+Run `edit NOTES.TXT` or `edit GAME.BAS` to open a 2 KiB scratchpad under that
+filename. Names are case-insensitive, may contain up to 12 letters, digits,
+dots, underscores, or hyphens, and are displayed in uppercase. `.TXT` and
+`.BAS` are conventions; both use the same text editor. Type at the end of the
+document, use Enter for a new line, and use Backspace to remove text. Both the
+BS and DEL terminal codes are accepted as Backspace. The editor redraws after
+deletion so editing remains correct across terminal line wraps.
 
 - Control-X — exit to the shell
 - Control-S — save the document to disk
 - Control-R — run the current document as a BASIC program
 - Control-L — clear the entire document
 
-The editor holds one document of up to 2,047 bytes. Control-S writes the current
-document to Nixodria's reserved storage sectors; the last valid save is loaded
-automatically after a reboot or a later QEMU launch. Control-X does not save, so
-unsaved edits are discarded at the next boot. Saves alternate between two
-records with generation numbers plus header and document CRC-16 checksums. If a
-save is interrupted or its newest record is corrupt, the editor recovers the
-previous verified version. A failed disk write is reported instead of being
-presented as a successful save. The inactive record intentionally retains that
-one previous version for recovery.
+Each of the eight file slots holds up to 2,047 bytes. Control-S saves only the
+open file; `files` then lists its filename so it can be reopened with
+`edit <filename>`. Control-X does not save, so edits made since the last
+Control-S are discarded after a reboot or later QEMU launch. Saves alternate
+between two complete directory snapshots with generation numbers plus header
+and per-file CRC-16 checksums. If a save is interrupted or the newest snapshot
+is corrupt, the editor recovers the previous verified snapshot. Failed disk
+writes and a full eight-file directory are reported instead of being presented
+as successful saves.
 
 Control-R runs the document currently in memory, including unsaved edits; it
 does not save implicitly. Program output is shown on the serial console, and a
@@ -75,10 +80,10 @@ For example:
 70 END
 ```
 
-The editor stores one program of at most 2,047 bytes. This BASIC subset does not
-provide multiple files, interactive input, string variables, `FOR`/`NEXT`,
-arrays, functions, multiplication, division, parentheses, or multiple
-statements on one line.
+Each BASIC file can contain a program of at most 2,047 bytes. The flat file
+store does not provide rename or delete operations. This BASIC subset does not
+provide interactive input, string variables, `FOR`/`NEXT`, arrays, functions,
+multiplication, division, parentheses, or multiple statements on one line.
 
 ## Build and run
 
@@ -113,8 +118,10 @@ no parity, and one stop bit.
 
 The reproducible blank image is `build/nixodria.img`. `make run` boots the
 gitignored `.nixodria/nixodria.img` runtime copy. Normal rebuilds refresh only
-its boot and kernel sectors, while preserving its saved document; `make clean`
-also leaves this runtime copy intact.
+its boot and kernel sectors while preserving every saved file; `make clean`
+also leaves this runtime copy intact. When an older single-document runtime
+image is first refreshed, its last valid save immediately appears as
+`UNTITLED.TXT`; the next save converts the disk record to the named-file format.
 
 ### Run inside Nixodria for Android
 

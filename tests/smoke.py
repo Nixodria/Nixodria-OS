@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Boot Nixodria OS in QEMU and exercise its shell and durable editor."""
+"""Boot Nixodria OS in QEMU and exercise named files and durable snapshots."""
 
 import os
 from pathlib import Path
@@ -16,26 +16,66 @@ class SmokeFailure(RuntimeError):
 
 
 SECTOR_SIZE = 512
-SYSTEM_SECTORS = 8
-SLOT_SECTORS = 5
-SLOT_SIZE = SLOT_SECTORS * SECTOR_SIZE
+IMAGE_SECTORS = 2880
+SYSTEM_SECTORS = 11
+SNAPSHOT_SECTORS = 33
+SNAPSHOT_SIZE = SNAPSHOT_SECTORS * SECTOR_SIZE
 STORAGE_OFFSET = SYSTEM_SECTORS * SECTOR_SIZE
-SLOT_HEADER_OFFSETS = (STORAGE_OFFSET, STORAGE_OFFSET + SLOT_SIZE)
-SLOT_PAYLOAD_OFFSETS = tuple(offset + SECTOR_SIZE for offset in SLOT_HEADER_OFFSETS)
-IMAGE_SIZE = (SYSTEM_SECTORS + 2 * SLOT_SECTORS) * SECTOR_SIZE
-STORAGE_MAGIC = b"NIX2"
+SNAPSHOT_OFFSETS = (STORAGE_OFFSET, STORAGE_OFFSET + SNAPSHOT_SIZE)
+SNAPSHOT_LBAS = (SYSTEM_SECTORS, SYSTEM_SECTORS + SNAPSHOT_SECTORS)
+STORAGE_END = STORAGE_OFFSET + 2 * SNAPSHOT_SIZE
+IMAGE_SIZE = IMAGE_SECTORS * SECTOR_SIZE
+STORAGE_MAGIC = b"NIX3"
+LEGACY_STORAGE_MAGIC = b"NIX2"
+MAX_FILES = 8
+FILENAME_SIZE = 13
+FILENAME_MAX = FILENAME_SIZE - 1
+ENTRY_OFFSET = 8
+ENTRY_SIZE = 18
+ENTRY_LENGTH_OFFSET = 14
+ENTRY_CHECKSUM_OFFSET = 16
+HEADER_CHECKSUM_OFFSET = ENTRY_OFFSET + MAX_FILES * ENTRY_SIZE
+FILE_CAPACITY = 2048
+DOCUMENT_MAX = FILE_CAPACITY - 1
 
 CLEAR_SCREEN = b"\x1b[2J\x1b[H"
-EDITOR_HEADER = (
-    CLEAR_SCREEN
-    + b"Nixodria Editor\r\n"
-    + b"Ctrl-S save | Ctrl-R run | Ctrl-X exit | Ctrl-L clear\r\n"
+EDITOR_CONTROLS = (
+    b"\r\nCtrl-S save | Ctrl-R run | Ctrl-X exit | Ctrl-L clear\r\n"
 )
-EDITOR_FRAME = EDITOR_HEADER + b"\r\n"
-EDITOR_SAVED_FRAME = EDITOR_HEADER + b"Saved.\r\n\r\n"
-EDITOR_FAILED_FRAME = EDITOR_HEADER + b"Save failed.\r\n\r\n"
 BASIC_FRAME = CLEAR_SCREEN + b"Nixodria BASIC\r\n\r\n"
 BASIC_FINISHED = b"\r\nProgram finished. Press any key."
+
+
+def normalize_filename(filename: bytes) -> bytes:
+    normalized = filename.upper()
+    if not 1 <= len(normalized) <= FILENAME_MAX:
+        raise ValueError("filename is outside the on-disk format")
+    if any(
+        not (
+            ord("A") <= value <= ord("Z")
+            or ord("0") <= value <= ord("9")
+            or value in b"._-"
+        )
+        for value in normalized
+    ):
+        raise ValueError("filename contains an unsupported byte")
+    return normalized
+
+
+def editor_header(filename: bytes) -> bytes:
+    return (
+        CLEAR_SCREEN
+        + b"Nixodria Editor: "
+        + normalize_filename(filename)
+        + EDITOR_CONTROLS
+    )
+
+
+def editor_frame(filename: bytes, status: bytes = b"") -> bytes:
+    frame = editor_header(filename)
+    if status:
+        frame += status + b"\r\n"
+    return frame + b"\r\n"
 
 
 class QemuSession:
@@ -112,7 +152,9 @@ class QemuSession:
             self.transcript.extend(chunk)
         status = self.process.poll()
         suffix = "" if status is None else f"; QEMU exited with status {status}"
-        rendered = bytes(self.transcript[-4096:]).decode("utf-8", errors="replace")
+        rendered = bytes(self.transcript[-4096:]).decode(
+            "utf-8", errors="replace"
+        )
         raise SmokeFailure(
             f"timed out waiting for {expected!r}{suffix}\n"
             f"--- session transcript tail ---\n{rendered}"
@@ -129,7 +171,9 @@ class QemuSession:
             assert self.process.stdout is not None
             chunk = os.read(self.process.stdout.fileno(), 4096)
             if not chunk:
-                raise SmokeFailure("QEMU closed its output instead of remaining halted")
+                raise SmokeFailure(
+                    "QEMU closed its output instead of remaining halted"
+                )
             self.transcript.extend(chunk)
         if len(self.transcript) != start:
             raise SmokeFailure("guest produced output after halt")
@@ -147,11 +191,27 @@ class QemuSession:
                 self.process.wait(timeout=2)
 
 
+def halt(session: QemuSession, cursor: int) -> None:
+    session.write(b"halt\r")
+    cursor = session.wait_for(b"halt\r\nHalted.\r\n", cursor)
+    session.assert_quiet(cursor)
+
+
 def assert_editor_document(
-    session: QemuSession, expected: bytes, start: int, enter: bytes = b"\r"
+    session: QemuSession,
+    filename: bytes,
+    expected: bytes,
+    start: int,
+    *,
+    entered_filename: bytes | None = None,
+    enter: bytes = b"\r",
 ) -> int:
-    session.write(b"edit" + enter)
-    body_start = session.wait_for(b"edit\r\n" + EDITOR_FRAME, start)
+    requested = filename if entered_filename is None else entered_filename
+    command = b"edit " + requested
+    session.write(command + enter)
+    body_start = session.wait_for(
+        command + b"\r\n" + editor_frame(filename), start
+    )
     session.write(b"\x18")
     end = session.wait_for(b"\r\nnix> ", body_start)
     actual = bytes(session.transcript[body_start:end])
@@ -163,10 +223,20 @@ def assert_editor_document(
     return end
 
 
-def halt(session: QemuSession, cursor: int) -> None:
-    session.write(b"halt\r")
-    cursor = session.wait_for(b"halt\r\nHalted.\r\n", cursor)
-    session.assert_quiet(cursor)
+def assert_files(
+    session: QemuSession,
+    expected: tuple[bytes, ...],
+    start: int,
+    enter: bytes = b"\r",
+) -> int:
+    session.write(b"files" + enter)
+    if expected:
+        listing = b"Files:\r\n" + b"".join(
+            normalize_filename(name) + b"\r\n" for name in expected
+        )
+    else:
+        listing = b"No files.\r\n"
+    return session.wait_for(b"files\r\n" + listing + b"nix> ", start)
 
 
 def checksum16(data: bytes) -> int:
@@ -181,70 +251,149 @@ def checksum16(data: bytes) -> int:
     return checksum
 
 
-def build_record(generation: int, document: bytes) -> bytes:
-    if len(document) > 2047:
-        raise ValueError("document exceeds the on-disk format")
+def build_legacy_record(generation: int, document: bytes) -> bytes:
+    if len(document) > DOCUMENT_MAX:
+        raise ValueError("document exceeds the legacy on-disk format")
     header = bytearray(SECTOR_SIZE)
-    header[:4] = STORAGE_MAGIC
+    header[:4] = LEGACY_STORAGE_MAGIC
     header[4:6] = (generation & 0xFFFF).to_bytes(2, "little")
     header[6:8] = len(document).to_bytes(2, "little")
     header[8:10] = checksum16(document).to_bytes(2, "little")
     header[10:12] = checksum16(header[:10]).to_bytes(2, "little")
-    payload = document + bytes(2048 - len(document))
-    return bytes(header) + payload
+    return bytes(header) + document + bytes(FILE_CAPACITY - len(document))
 
 
-def install_record(image: bytearray, slot: int, record: bytes) -> None:
-    if len(record) != SLOT_SIZE:
-        raise ValueError("save record has the wrong size")
-    start = SLOT_HEADER_OFFSETS[slot]
-    image[start : start + SLOT_SIZE] = record
+def build_snapshot(
+    generation: int, files: tuple[tuple[bytes, bytes], ...]
+) -> bytes:
+    if len(files) > MAX_FILES:
+        raise ValueError("snapshot has too many files")
+    header = bytearray(SECTOR_SIZE)
+    payloads = bytearray(MAX_FILES * FILE_CAPACITY)
+    header[:4] = STORAGE_MAGIC
+    header[4:6] = (generation & 0xFFFF).to_bytes(2, "little")
+    header[6] = len(files)
+    names: set[bytes] = set()
+    for index, (filename, document) in enumerate(files):
+        name = normalize_filename(filename)
+        if name in names:
+            raise ValueError("snapshot has duplicate filenames")
+        if len(document) > DOCUMENT_MAX:
+            raise ValueError("document exceeds the on-disk format")
+        names.add(name)
+        entry = ENTRY_OFFSET + index * ENTRY_SIZE
+        header[entry : entry + len(name)] = name
+        header[entry + ENTRY_LENGTH_OFFSET : entry + ENTRY_LENGTH_OFFSET + 2] = (
+            len(document).to_bytes(2, "little")
+        )
+        header[
+            entry + ENTRY_CHECKSUM_OFFSET : entry + ENTRY_CHECKSUM_OFFSET + 2
+        ] = checksum16(document).to_bytes(2, "little")
+        payload = index * FILE_CAPACITY
+        payloads[payload : payload + len(document)] = document
+    header[HEADER_CHECKSUM_OFFSET : HEADER_CHECKSUM_OFFSET + 2] = checksum16(
+        header[:HEADER_CHECKSUM_OFFSET]
+    ).to_bytes(2, "little")
+    return bytes(header + payloads)
 
 
-def parse_record(data: bytes, slot: int) -> tuple[int, bytes] | None:
-    header_offset = SLOT_HEADER_OFFSETS[slot]
-    payload_offset = SLOT_PAYLOAD_OFFSETS[slot]
-    header = data[header_offset:payload_offset]
-    payload = data[payload_offset : payload_offset + 2048]
-    if header[:4] != STORAGE_MAGIC:
+def install_snapshot(image: bytearray, slot: int, snapshot: bytes) -> None:
+    if len(snapshot) != SNAPSHOT_SIZE:
+        raise ValueError("file snapshot has the wrong size")
+    start = SNAPSHOT_OFFSETS[slot]
+    image[start : start + SNAPSHOT_SIZE] = snapshot
+
+
+def install_legacy_record(image: bytearray, slot: int, record: bytes) -> None:
+    if len(record) != 5 * SECTOR_SIZE:
+        raise ValueError("legacy record has the wrong size")
+    start = SNAPSHOT_OFFSETS[slot]
+    image[start : start + len(record)] = record
+
+
+def parse_snapshot(
+    data: bytes, slot: int
+) -> tuple[int, tuple[tuple[bytes, bytes], ...]] | None:
+    snapshot_offset = SNAPSHOT_OFFSETS[slot]
+    header = data[snapshot_offset : snapshot_offset + SECTOR_SIZE]
+    if header[:4] != STORAGE_MAGIC or header[7] != 0:
         return None
     generation = int.from_bytes(header[4:6], "little")
-    length = int.from_bytes(header[6:8], "little")
-    if length > 2047:
+    file_count = header[6]
+    if file_count > MAX_FILES:
         return None
-    if int.from_bytes(header[10:12], "little") != checksum16(header[:10]):
+    expected_header_checksum = int.from_bytes(
+        header[HEADER_CHECKSUM_OFFSET : HEADER_CHECKSUM_OFFSET + 2], "little"
+    )
+    if expected_header_checksum != checksum16(header[:HEADER_CHECKSUM_OFFSET]):
         return None
-    document = payload[:length]
-    if int.from_bytes(header[8:10], "little") != checksum16(document):
-        return None
-    return generation, document
+
+    files: list[tuple[bytes, bytes]] = []
+    names: set[bytes] = set()
+    for index in range(file_count):
+        entry = ENTRY_OFFSET + index * ENTRY_SIZE
+        name_field = header[entry : entry + FILENAME_SIZE]
+        nul = name_field.find(b"\0")
+        if nul <= 0 or any(name_field[nul + 1 :]):
+            return None
+        name = name_field[:nul]
+        try:
+            if normalize_filename(name) != name:
+                return None
+        except ValueError:
+            return None
+        if name in names or header[entry + FILENAME_SIZE] != 0:
+            return None
+        length = int.from_bytes(
+            header[
+                entry + ENTRY_LENGTH_OFFSET : entry + ENTRY_LENGTH_OFFSET + 2
+            ],
+            "little",
+        )
+        if length > DOCUMENT_MAX:
+            return None
+        payload = snapshot_offset + SECTOR_SIZE + index * FILE_CAPACITY
+        document = data[payload : payload + length]
+        expected_file_checksum = int.from_bytes(
+            header[
+                entry + ENTRY_CHECKSUM_OFFSET : entry + ENTRY_CHECKSUM_OFFSET + 2
+            ],
+            "little",
+        )
+        if expected_file_checksum != checksum16(document):
+            return None
+        names.add(name)
+        files.append((name, document))
+    return generation, tuple(files)
 
 
-def newest_record(data: bytes) -> tuple[int, int, bytes] | None:
-    record_a = parse_record(data, 0)
-    record_b = parse_record(data, 1)
-    if record_a is None and record_b is None:
+def newest_snapshot(
+    data: bytes,
+) -> tuple[int, int, tuple[tuple[bytes, bytes], ...]] | None:
+    snapshot_a = parse_snapshot(data, 0)
+    snapshot_b = parse_snapshot(data, 1)
+    if snapshot_a is None and snapshot_b is None:
         return None
-    if record_b is None:
-        assert record_a is not None
-        generation, document = record_a
-        return 0, generation, document
-    if record_a is None:
-        generation, document = record_b
-        return 1, generation, document
+    if snapshot_b is None:
+        assert snapshot_a is not None
+        generation, files = snapshot_a
+        return 0, generation, files
+    if snapshot_a is None:
+        generation, files = snapshot_b
+        return 1, generation, files
 
-    generation_a, document_a = record_a
-    generation_b, document_b = record_b
+    generation_a, files_a = snapshot_a
+    generation_b, files_b = snapshot_b
     delta = (generation_a - generation_b) & 0xFFFF
     if delta <= 0x8000:
-        return 0, generation_a, document_a
-    return 1, generation_b, document_b
+        return 0, generation_a, files_a
+    return 1, generation_b, files_b
 
 
-def assert_saved_record(
+def assert_saved_snapshot(
     image: Path,
-    expected: bytes,
-    system: bytes,
+    expected: tuple[tuple[bytes, bytes], ...],
+    template: bytes,
     *,
     expected_slot: int,
     expected_generation: int,
@@ -252,29 +401,63 @@ def assert_saved_record(
     data = image.read_bytes()
     if len(data) != IMAGE_SIZE:
         raise SmokeFailure(f"runtime image changed size to {len(data)} bytes")
-    if data[: len(system)] != system:
-        raise SmokeFailure("saving text changed boot or kernel sectors")
+    if data[:STORAGE_OFFSET] != template[:STORAGE_OFFSET]:
+        raise SmokeFailure("saving files changed boot or kernel sectors")
+    if data[STORAGE_END:] != template[STORAGE_END:]:
+        raise SmokeFailure("saving files changed unused floppy sectors")
 
-    newest = newest_record(data)
-    wanted = (expected_slot, expected_generation, expected)
+    normalized = tuple(
+        (normalize_filename(filename), document) for filename, document in expected
+    )
+    newest = newest_snapshot(data)
+    wanted = (expected_slot, expected_generation, normalized)
     if newest != wanted:
-        raise SmokeFailure(f"newest save is {newest!r}; expected {wanted!r}")
+        raise SmokeFailure(f"newest snapshot is {newest!r}; expected {wanted!r}")
 
     for slot in range(2):
-        record = parse_record(data, slot)
-        if record is None:
+        snapshot = parse_snapshot(data, slot)
+        if snapshot is None:
             continue
-        _, document = record
-        header_offset = SLOT_HEADER_OFFSETS[slot]
-        payload_offset = SLOT_PAYLOAD_OFFSETS[slot]
-        header = data[header_offset:payload_offset]
-        payload = data[payload_offset : payload_offset + 2048]
-        if any(header[12:]) or any(payload[len(document) :]):
-            raise SmokeFailure(f"slot {slot} retained nonzero unused bytes")
+        _, files = snapshot
+        snapshot_offset = SNAPSHOT_OFFSETS[slot]
+        header = data[snapshot_offset : snapshot_offset + SECTOR_SIZE]
+        unused_entries = header[
+            ENTRY_OFFSET + len(files) * ENTRY_SIZE : HEADER_CHECKSUM_OFFSET
+        ]
+        if any(unused_entries) or any(header[HEADER_CHECKSUM_OFFSET + 2 :]):
+            raise SmokeFailure(f"snapshot {slot} retained unused header bytes")
+        for index, (_, document) in enumerate(files):
+            payload = snapshot_offset + SECTOR_SIZE + index * FILE_CAPACITY
+            if any(data[payload + len(document) : payload + FILE_CAPACITY]):
+                raise SmokeFailure(
+                    f"snapshot {slot} file {index} retained deleted content"
+                )
+        unused_payload = (
+            snapshot_offset + SECTOR_SIZE + len(files) * FILE_CAPACITY
+        )
+        if any(data[unused_payload : snapshot_offset + SNAPSHOT_SIZE]):
+            raise SmokeFailure(f"snapshot {slot} retained unused file payloads")
     return data
 
 
-def exercise_basic(qemu: str, image: Path) -> None:
+def assert_files_on_boot(
+    qemu: str,
+    image: Path,
+    expected: tuple[tuple[bytes, bytes], ...],
+) -> None:
+    with QemuSession(qemu, image) as session:
+        cursor = session.wait_for(b"nix> ", 0)
+        cursor = assert_files(
+            session, tuple(filename for filename, _ in expected), cursor
+        )
+        for filename, document in expected:
+            cursor = assert_editor_document(session, filename, document, cursor)
+        halt(session, cursor)
+
+
+def exercise_basic(qemu: str, image: Path, template: bytes) -> None:
+    filename = b"PROGRAM.BAS"
+    entered = b"program.bas"
     program = (
         b"10 rem keywords are case insensitive\r\n"
         b"20 print a\r\n"
@@ -295,48 +478,61 @@ def exercise_basic(qemu: str, image: Path) -> None:
     successful_run = BASIC_FRAME + output + BASIC_FINISHED
     original = image.read_bytes()
 
-    # Ctrl-R executes unsaved source and returns to the unchanged editor. It
-    # must not write any part of the disk image.
     with QemuSession(qemu, image) as session:
         cursor = session.wait_for(b"nix> ", 0)
-        session.write(b"edit\r")
-        cursor = session.wait_for(b"edit\r\n" + EDITOR_FRAME, cursor)
+        cursor = assert_files(session, (), cursor)
+        command = b"edit " + entered
+        session.write(command + b"\r")
+        cursor = session.wait_for(
+            command + b"\r\n" + editor_frame(filename), cursor
+        )
         session.write(program + b"\x12")
         cursor = session.wait_for(program + successful_run, cursor)
         session.write(b" ")
-        cursor = session.wait_for(EDITOR_FRAME + program, cursor)
+        cursor = session.wait_for(editor_frame(filename) + program, cursor)
         session.write(b"\x18")
         cursor = session.wait_for(b"\r\nnix> ", cursor)
+        cursor = assert_files(session, (), cursor)
         halt(session, cursor)
     if image.read_bytes() != original:
-        raise SmokeFailure("running unsaved BASIC changed the disk image")
+        raise SmokeFailure("running an unsaved BASIC file changed the disk image")
 
-    # Save the source, run it, reboot, and run it again. Identical output also
-    # proves that variables are reset at the beginning of each execution.
     with QemuSession(qemu, image) as session:
         cursor = session.wait_for(b"nix> ", 0)
-        session.write(b"edit\r")
-        cursor = session.wait_for(b"edit\r\n" + EDITOR_FRAME, cursor)
+        command = b"edit " + entered
+        session.write(command + b"\r")
+        cursor = session.wait_for(
+            command + b"\r\n" + editor_frame(filename), cursor
+        )
         session.write(program + b"\x13")
-        cursor = session.wait_for(program + EDITOR_SAVED_FRAME + program, cursor)
+        cursor = session.wait_for(
+            program + editor_frame(filename, b"Saved.") + program, cursor
+        )
         session.write(b"\x12")
         cursor = session.wait_for(successful_run, cursor)
         session.write(b" ")
-        cursor = session.wait_for(EDITOR_FRAME + program, cursor)
+        cursor = session.wait_for(editor_frame(filename) + program, cursor)
         session.write(b"\x18reboot\r")
-        cursor = session.wait_for(b"\r\nnix> reboot\r\nRebooting...\r\n", cursor)
-        cursor = session.wait_for(b"Nixodria OS\r\nType help.\r\nnix> ", cursor)
-        session.write(b"edit\r")
-        cursor = session.wait_for(b"edit\r\n" + EDITOR_FRAME + program, cursor)
+        cursor = session.wait_for(
+            b"\r\nnix> reboot\r\nRebooting...\r\n", cursor
+        )
+        cursor = session.wait_for(
+            b"Nixodria OS\r\nType help.\r\nnix> ", cursor
+        )
+        cursor = assert_files(session, (filename,), cursor)
+
+        session.write(command + b"\r")
+        cursor = session.wait_for(
+            command + b"\r\n" + editor_frame(filename) + program, cursor
+        )
         session.write(b"\x12")
         cursor = session.wait_for(successful_run, cursor)
         session.write(b" ")
-        cursor = session.wait_for(EDITOR_FRAME + program, cursor)
+        cursor = session.wait_for(editor_frame(filename) + program, cursor)
 
-        # A missing jump target reports the executing line and returns safely.
         missing_line = b'10 print "BEFORE"\r\n20 goto 999'
         session.write(b"\x0c")
-        cursor = session.wait_for(EDITOR_FRAME, cursor)
+        cursor = session.wait_for(editor_frame(filename), cursor)
         session.write(missing_line + b"\x12")
         cursor = session.wait_for(
             missing_line
@@ -344,15 +540,12 @@ def exercise_basic(qemu: str, image: Path) -> None:
             + b"BEFORE\r\n\r\nBASIC error at line 20. Press any key.",
             cursor,
         )
-        # CRLF dismissal must not insert a newline into the editor source.
         session.write(b"\r\n")
-        cursor = session.wait_for(EDITOR_FRAME + missing_line, cursor)
+        cursor = session.wait_for(editor_frame(filename) + missing_line, cursor)
 
-        # Decimal input outside the supported 16-bit range is rejected rather
-        # than wrapping to another value or line number.
         overflow_program = b"10 print 65536"
         session.write(b"\x0c")
-        cursor = session.wait_for(EDITOR_FRAME, cursor)
+        cursor = session.wait_for(editor_frame(filename), cursor)
         session.write(overflow_program + b"\x12")
         cursor = session.wait_for(
             overflow_program
@@ -361,17 +554,24 @@ def exercise_basic(qemu: str, image: Path) -> None:
             cursor,
         )
         session.write(b" ")
-        cursor = session.wait_for(EDITOR_FRAME + overflow_program, cursor)
+        cursor = session.wait_for(
+            editor_frame(filename) + overflow_program, cursor
+        )
         session.write(b"\x18reboot\r")
-        cursor = session.wait_for(b"\r\nnix> reboot\r\nRebooting...\r\n", cursor)
-        cursor = session.wait_for(b"Nixodria OS\r\nType help.\r\nnix> ", cursor)
+        cursor = session.wait_for(
+            b"\r\nnix> reboot\r\nRebooting...\r\n", cursor
+        )
+        cursor = session.wait_for(
+            b"Nixodria OS\r\nType help.\r\nnix> ", cursor
+        )
 
-        # The bounded execution guard breaks an accidental infinite loop.
-        session.write(b"edit\r")
-        cursor = session.wait_for(b"edit\r\n" + EDITOR_FRAME + program, cursor)
+        session.write(command + b"\r")
+        cursor = session.wait_for(
+            command + b"\r\n" + editor_frame(filename) + program, cursor
+        )
         guard_program = b"10 goto 10"
         session.write(b"\x0c")
-        cursor = session.wait_for(EDITOR_FRAME, cursor)
+        cursor = session.wait_for(editor_frame(filename), cursor)
         session.write(guard_program + b"\x12")
         cursor = session.wait_for(
             guard_program
@@ -381,172 +581,267 @@ def exercise_basic(qemu: str, image: Path) -> None:
             timeout=10.0,
         )
         session.write(b" ")
-        cursor = session.wait_for(EDITOR_FRAME + guard_program, cursor)
+        cursor = session.wait_for(editor_frame(filename) + guard_program, cursor)
         session.write(b"\x18reboot\r")
-        cursor = session.wait_for(b"\r\nnix> reboot\r\nRebooting...\r\n", cursor)
-        cursor = session.wait_for(b"Nixodria OS\r\nType help.\r\nnix> ", cursor)
-        cursor = assert_editor_document(session, program, cursor)
+        cursor = session.wait_for(
+            b"\r\nnix> reboot\r\nRebooting...\r\n", cursor
+        )
+        cursor = session.wait_for(
+            b"Nixodria OS\r\nType help.\r\nnix> ", cursor
+        )
+        cursor = assert_editor_document(
+            session,
+            filename,
+            program,
+            cursor,
+            entered_filename=b"PrOgRaM.BaS",
+        )
         halt(session, cursor)
 
-    newest = newest_record(image.read_bytes())
-    if newest != (0, 0, program):
-        raise SmokeFailure(f"saved BASIC program changed unexpectedly: {newest!r}")
+    assert_saved_snapshot(
+        image,
+        ((filename, program),),
+        template,
+        expected_slot=0,
+        expected_generation=0,
+    )
 
 
-def exercise_editor_and_save(qemu: str, image: Path) -> bytes:
+def exercise_filename_rules(qemu: str, image: Path) -> None:
+    with QemuSession(qemu, image) as session:
+        cursor = session.wait_for(b"nix> ", 0)
+        session.write(b"help\r\n")
+        cursor = session.wait_for(
+            b"help\r\n"
+            b"help files edit [filename] clear echo <text> reboot halt\r\n"
+            b"nix> ",
+            cursor,
+        )
+        cursor = assert_files(session, (), cursor)
+
+        for invalid in (b"bad/name", b"has space", b"x" * 13):
+            command = b"edit " + invalid
+            session.write(command + b"\r")
+            cursor = session.wait_for(
+                command + b"\r\nInvalid filename.\r\nnix> ", cursor
+            )
+
+        valid = b"a_b-c.d12345"
+        command = b"edit " + valid
+        session.write(command + b"\r")
+        cursor = session.wait_for(
+            command + b"\r\n" + editor_frame(valid), cursor
+        )
+        session.write(b"not saved\x18")
+        cursor = session.wait_for(b"not saved\r\nnix> ", cursor)
+        cursor = assert_files(session, (), cursor)
+
+        session.write(b"edit\r")
+        cursor = session.wait_for(
+            b"edit\r\n" + editor_frame(b"UNTITLED.TXT"), cursor
+        )
+        session.write(b"temporary\x18")
+        cursor = session.wait_for(b"temporary\r\nnix> ", cursor)
+        cursor = assert_files(session, (), cursor)
+        halt(session, cursor)
+
+
+def exercise_first_named_file(qemu: str, image: Path) -> bytes:
+    filename = b"NOTES.TXT"
     full_document = b"A" * 510 + b"\r\n" + b"B" * 512 + b"C" * 512 + b"D" * 511
     with QemuSession(qemu, image) as session:
         cursor = session.wait_for(b"nix> ", 0)
-
-        session.write(b"help\r\n")
-        cursor = session.wait_for(
-            b"help\r\nhelp edit clear echo <text> reboot halt\r\nnix> ", cursor
-        )
-
         session.write(b"echo tinx\by\r")
         cursor = session.wait_for(b"echo tinx\b \by\r\ntiny\r\nnix> ", cursor)
-
         session.write(b"nope\r")
-        cursor = session.wait_for(b"nope\r\nUnknown command.\r\nnix> ", cursor)
-
-        # CRLF creates one editor newline. Empty-buffer Backspace and Delete
-        # are no-ops, while Backspace edits the end of a line.
-        session.write(b"edit\r\n")
-        cursor = session.wait_for(b"edit\r\n" + EDITOR_FRAME, cursor)
-        session.write(b"\x08\x7falpha\r\nbetx\x08y\x18")
         cursor = session.wait_for(
-            b"alpha\r\nbetx"
-            + EDITOR_FRAME
-            + b"alpha\r\nbety\r\nnix> ",
+            b"nope\r\nUnknown command.\r\nnix> ", cursor
+        )
+
+        command = b"edit notes.txt"
+        session.write(command + b"\r\n")
+        cursor = session.wait_for(
+            command + b"\r\n" + editor_frame(filename), cursor
+        )
+        session.write(b"\x08\x7falpha\r\nbetx\x08y")
+        cursor = session.wait_for(
+            b"alpha\r\nbetx" + editor_frame(filename) + b"alpha\r\nbety",
             cursor,
         )
+        session.write(b"\x0c")
+        cursor = session.wait_for(editor_frame(filename), cursor)
 
-        # Shell input cannot overwrite the separate editor buffer.
-        session.write(b"help\r")
-        cursor = session.wait_for(
-            b"help\r\nhelp edit clear echo <text> reboot halt\r\nnix> ", cursor
-        )
-        cursor = assert_editor_document(session, b"alpha\r\nbety", cursor, b"\r\n")
-
-        # Deleting four characters and one CRLF joins the lines.
-        session.write(b"edit\r")
-        cursor = session.wait_for(b"edit\r\n" + EDITOR_FRAME + b"alpha\r\nbety", cursor)
-        session.write(b"\x08\x08\x08\x08\x08Z\x18")
-        cursor = session.wait_for(EDITOR_FRAME + b"alphaZ\r\nnix> ", cursor)
-        cursor = assert_editor_document(session, b"alphaZ", cursor, b"\n")
-
-        # CR, LF, and CRLF each create one stored newline.
-        session.write(b"edit\r")
-        cursor = session.wait_for(b"edit\r\n" + EDITOR_FRAME + b"alphaZ", cursor)
-        session.write(b"\x0ca\rb\nc\r\nd\x18")
-        cursor = session.wait_for(
-            EDITOR_FRAME + b"a\r\nb\r\nc\r\nd\r\nnix> ", cursor
-        )
-
-        long_unknown = b"x" * 31
-        session.write(long_unknown + b"\r")
-        cursor = session.wait_for(
-            long_unknown + b"\r\nUnknown command.\r\nnix> ", cursor
-        )
-        cursor = assert_editor_document(session, b"a\r\nb\r\nc\r\nd", cursor, b"\r\n")
-
-        # Fill all 2,047 content bytes across every payload sector. Excess
-        # input rings the bell; deletion and control keys remain usable.
-        session.write(b"edit\r\x0c")
-        cursor = session.wait_for(b"edit\r\n" + EDITOR_FRAME, cursor)
         session.write(full_document + b"Z")
         cursor = session.wait_for(full_document + b"\x07", cursor)
         session.write(b"\x08D")
-        cursor = session.wait_for(EDITOR_FRAME + full_document, cursor)
-
+        cursor = session.wait_for(editor_frame(filename) + full_document, cursor)
         session.write(b"\x13")
-        cursor = session.wait_for(EDITOR_SAVED_FRAME + full_document, cursor)
+        cursor = session.wait_for(
+            editor_frame(filename, b"Saved.") + full_document, cursor
+        )
         session.write(b"\x18")
         cursor = session.wait_for(b"\r\nnix> ", cursor)
+        cursor = assert_files(session, (filename,), cursor)
 
         session.write(b"clear\r")
-        cursor = session.wait_for(b"clear\r\n\x1b[2J\x1b[Hnix> ", cursor)
-
-        # A guest BIOS reboot reloads the saved record.
+        cursor = session.wait_for(
+            b"clear\r\n\x1b[2J\x1b[Hnix> ", cursor
+        )
         session.write(b"reboot\r")
         cursor = session.wait_for(b"reboot\r\nRebooting...\r\n", cursor)
-        cursor = session.wait_for(b"Nixodria OS\r\nType help.\r\nnix> ", cursor)
-        cursor = assert_editor_document(session, full_document, cursor, b"\r\n")
+        cursor = session.wait_for(
+            b"Nixodria OS\r\nType help.\r\nnix> ", cursor
+        )
+        cursor = assert_editor_document(
+            session,
+            filename,
+            full_document,
+            cursor,
+            entered_filename=b"notes.txt",
+            enter=b"\r\n",
+        )
 
-        # Exiting without Ctrl-S leaves the last durable version intact.
-        session.write(b"edit\r")
-        cursor = session.wait_for(b"edit\r\n" + EDITOR_FRAME + full_document, cursor)
+        session.write(command + b"\r")
+        cursor = session.wait_for(
+            command + b"\r\n" + editor_frame(filename) + full_document,
+            cursor,
+        )
         session.write(b"\x0ctemporary\x18")
-        cursor = session.wait_for(EDITOR_FRAME + b"temporary\r\nnix> ", cursor)
-        session.write(b"reboot\r")
-        cursor = session.wait_for(b"reboot\r\nRebooting...\r\n", cursor)
-        cursor = session.wait_for(b"Nixodria OS\r\nType help.\r\nnix> ", cursor)
-        cursor = assert_editor_document(session, full_document, cursor)
+        cursor = session.wait_for(
+            editor_frame(filename) + b"temporary\r\nnix> ", cursor
+        )
+        cursor = assert_editor_document(session, filename, full_document, cursor)
         halt(session, cursor)
-
     return full_document
 
 
-def exercise_process_restart(qemu: str, image: Path, expected: bytes) -> bytes:
-    replacement = b"saved across\r\nfull process restarts"
+def exercise_second_named_file(
+    qemu: str, image: Path, notes: bytes
+) -> bytes:
+    filename = b"COUNT.BAS"
+    program = b'10 print "SECOND"\r\n20 end'
+    successful_run = BASIC_FRAME + b"SECOND\r\n" + BASIC_FINISHED
     with QemuSession(qemu, image) as session:
         cursor = session.wait_for(b"nix> ", 0)
-        cursor = assert_editor_document(session, expected, cursor)
-
-        session.write(b"edit\r")
-        cursor = session.wait_for(b"edit\r\n" + EDITOR_FRAME + expected, cursor)
-        session.write(b"\x0c")
-        cursor = session.wait_for(EDITOR_FRAME, cursor)
-        session.write(replacement + b"\x13")
+        cursor = assert_files(session, (b"NOTES.TXT",), cursor)
+        command = b"edit count.bas"
+        session.write(command + b"\r")
         cursor = session.wait_for(
-            replacement + EDITOR_SAVED_FRAME + replacement, cursor
+            command + b"\r\n" + editor_frame(filename), cursor
         )
-        # End QEMU immediately after the guest acknowledges the save. The next
-        # process must recover it without an editor exit, guest halt, or delay.
+        session.write(program + b"\x13")
+        cursor = session.wait_for(
+            program + editor_frame(filename, b"Saved.") + program, cursor
+        )
+        session.write(b"\x12")
+        cursor = session.wait_for(successful_run, cursor)
+        session.write(b" ")
+        cursor = session.wait_for(editor_frame(filename) + program, cursor)
+        session.write(b"\x18")
+        cursor = session.wait_for(b"\r\nnix> ", cursor)
+
+        cursor = assert_files(session, (b"NOTES.TXT", filename), cursor)
+        cursor = assert_editor_document(
+            session,
+            filename,
+            program,
+            cursor,
+            entered_filename=b"CoUnT.BaS",
+        )
+        cursor = assert_editor_document(session, b"NOTES.TXT", notes, cursor)
+
+        session.write(b"reboot\r")
+        cursor = session.wait_for(b"reboot\r\nRebooting...\r\n", cursor)
+        cursor = session.wait_for(
+            b"Nixodria OS\r\nType help.\r\nnix> ", cursor
+        )
+        cursor = assert_files(session, (b"NOTES.TXT", filename), cursor)
+        cursor = assert_editor_document(session, b"NOTES.TXT", notes, cursor)
+        cursor = assert_editor_document(session, filename, program, cursor)
+        halt(session, cursor)
+    return program
+
+
+def exercise_process_restart(
+    qemu: str, image: Path, basic_program: bytes
+) -> bytes:
+    replacement = b"saved across\r\nfull process restarts"
+    filename = b"NOTES.TXT"
+    with QemuSession(qemu, image) as session:
+        cursor = session.wait_for(b"nix> ", 0)
+        command = b"edit NOTES.TXT"
+        session.write(command + b"\r")
+        cursor = session.wait_for(
+            command + b"\r\n" + editor_frame(filename), cursor
+        )
+        session.write(b"\x0c")
+        cursor = session.wait_for(editor_frame(filename), cursor)
+        session.write(replacement + b"\x13")
+        session.wait_for(
+            replacement + editor_frame(filename, b"Saved.") + replacement,
+            cursor,
+        )
+        # End QEMU as soon as the guest acknowledges the snapshot commit.
+    assert_files_on_boot(
+        qemu,
+        image,
+        ((filename, replacement), (b"COUNT.BAS", basic_program)),
+    )
     return replacement
 
 
-def exercise_readonly_failure(qemu: str, image: Path, expected: bytes) -> None:
+def exercise_readonly_failure(
+    qemu: str,
+    image: Path,
+    expected: tuple[tuple[bytes, bytes], ...],
+) -> None:
     before = image.read_bytes()
+    filename, document = expected[0]
     with QemuSession(qemu, image, readonly=True) as session:
         cursor = session.wait_for(b"nix> ", 0)
-        session.write(b"edit\r")
-        cursor = session.wait_for(b"edit\r\n" + EDITOR_FRAME + expected, cursor)
-        changed = expected + b"!"
+        command = b"edit " + filename
+        session.write(command + b"\r")
+        cursor = session.wait_for(
+            command + b"\r\n" + editor_frame(filename) + document, cursor
+        )
+        changed = document + b"!"
         session.write(b"!\x13")
-        cursor = session.wait_for(b"!" + EDITOR_FAILED_FRAME + changed, cursor)
+        cursor = session.wait_for(
+            b"!" + editor_frame(filename, b"Save failed.") + changed, cursor
+        )
         session.write(b"\x18")
         cursor = session.wait_for(b"\r\nnix> ", cursor)
         halt(session, cursor)
     if image.read_bytes() != before:
         raise SmokeFailure("read-only save attempt changed the disk image")
-    assert_document_on_boot(qemu, image, expected)
-
-
-def assert_document_on_boot(qemu: str, image: Path, expected: bytes) -> None:
-    with QemuSession(qemu, image) as session:
-        cursor = session.wait_for(b"nix> ", 0)
-        cursor = assert_editor_document(session, expected, cursor)
-        halt(session, cursor)
+    assert_files_on_boot(qemu, image, expected)
 
 
 def exercise_injected_write_failures(
-    qemu: str, source: Path, directory: Path, expected: bytes
+    qemu: str,
+    source: Path,
+    directory: Path,
+    expected: tuple[tuple[bytes, bytes], ...],
 ) -> None:
     original = source.read_bytes()
-    slot_b = slice(SLOT_HEADER_OFFSETS[1], SLOT_HEADER_OFFSETS[1] + SLOT_SIZE)
+    active_snapshot = slice(
+        SNAPSHOT_OFFSETS[0], SNAPSHOT_OFFSETS[0] + SNAPSHOT_SIZE
+    )
+    target_header = SNAPSHOT_OFFSETS[1]
+    target_payload = target_header + SECTOR_SIZE
+    target_lba = SNAPSHOT_LBAS[1]
     configurations = {
         "invalidation": f"""
 [inject-error]
 event = "write_aio"
 errno = "5"
-sector = "{SYSTEM_SECTORS}"
+sector = "{target_lba}"
 """,
         "second-payload-sector": f"""
 [inject-error]
 event = "write_aio"
 errno = "5"
-sector = "{SYSTEM_SECTORS + 2}"
+sector = "{target_lba + 2}"
 """,
         "final-header": f"""
 [set-state]
@@ -558,52 +853,67 @@ new_state = "2"
 event = "write_aio"
 state = "2"
 errno = "5"
-sector = "{SYSTEM_SECTORS}"
+sector = "{target_lba}"
 """,
     }
+    candidate = b"candidate blocked during snapshot save"
+    candidate_files = ((expected[0][0], candidate),) + expected[1:]
+    candidate_snapshot = build_snapshot(3, candidate_files)
 
     for name, configuration in configurations.items():
         image = directory / f"fault-{name}.img"
         config = directory / f"fault-{name}.conf"
         image.write_bytes(original)
         config.write_text(configuration.strip() + "\n", encoding="utf-8")
-        candidate = f"candidate blocked at {name}".encode()
 
         with QemuSession(qemu, image, blkdebug_config=config) as session:
             cursor = session.wait_for(b"nix> ", 0)
-            session.write(b"edit\r")
-            cursor = session.wait_for(b"edit\r\n" + EDITOR_FRAME + expected, cursor)
+            filename, document = expected[0]
+            command = b"edit " + filename
+            session.write(command + b"\r")
+            cursor = session.wait_for(
+                command + b"\r\n" + editor_frame(filename) + document,
+                cursor,
+            )
             session.write(b"\x0c")
-            cursor = session.wait_for(EDITOR_FRAME, cursor)
+            cursor = session.wait_for(editor_frame(filename), cursor)
             session.write(candidate + b"\x13")
             cursor = session.wait_for(
-                candidate + EDITOR_FAILED_FRAME + candidate, cursor
+                candidate
+                + editor_frame(filename, b"Save failed.")
+                + candidate,
+                cursor,
+                timeout=10.0,
             )
             session.write(b"\x18")
             cursor = session.wait_for(b"\r\nnix> ", cursor)
             halt(session, cursor)
 
-        failed_image = image.read_bytes()
-        if failed_image[slot_b] != original[slot_b]:
-            raise SmokeFailure(f"{name} failure changed the active slot")
+        failed = image.read_bytes()
+        if failed[active_snapshot] != original[active_snapshot]:
+            raise SmokeFailure(f"{name} failure changed the active snapshot")
         if name == "invalidation":
-            if failed_image != original:
+            if failed != original:
                 raise SmokeFailure("failed invalidation changed the disk image")
         else:
-            header = failed_image[
-                SLOT_HEADER_OFFSETS[0] : SLOT_PAYLOAD_OFFSETS[0]
-            ]
-            if any(header):
-                raise SmokeFailure(f"{name} failure left a valid-looking target header")
-            payload = failed_image[
-                SLOT_PAYLOAD_OFFSETS[0] : SLOT_PAYLOAD_OFFSETS[0] + 2048
-            ]
-            padded = candidate + bytes(2048 - len(candidate))
-            if name == "second-payload-sector" and payload[:512] != padded[:512]:
-                raise SmokeFailure("payload failure did not commit its first sector")
-            if name == "final-header" and payload != padded:
-                raise SmokeFailure("final-header failure did not reach its commit stage")
-        assert_document_on_boot(qemu, image, expected)
+            if any(failed[target_header : target_header + SECTOR_SIZE]):
+                raise SmokeFailure(
+                    f"{name} failure left a valid-looking target header"
+                )
+            payload = failed[target_payload : target_header + SNAPSHOT_SIZE]
+            expected_payload = candidate_snapshot[SECTOR_SIZE:]
+            if (
+                name == "second-payload-sector"
+                and payload[:SECTOR_SIZE] != expected_payload[:SECTOR_SIZE]
+            ):
+                raise SmokeFailure(
+                    "payload failure did not commit its first sector"
+                )
+            if name == "final-header" and payload != expected_payload:
+                raise SmokeFailure(
+                    "final-header failure did not write the complete candidate"
+                )
+        assert_files_on_boot(qemu, image, expected)
 
 
 def write_variant(
@@ -611,43 +921,62 @@ def write_variant(
     directory: Path,
     name: str,
     data: bytearray,
-    expected: bytes,
+    expected: tuple[tuple[bytes, bytes], ...],
 ) -> None:
     image = directory / f"recovery-{name}.img"
     image.write_bytes(data)
-    assert_document_on_boot(qemu, image, expected)
+    assert_files_on_boot(qemu, image, expected)
+
+
+def update_header_checksum(data: bytearray, slot: int) -> None:
+    header = SNAPSHOT_OFFSETS[slot]
+    data[
+        header + HEADER_CHECKSUM_OFFSET : header + HEADER_CHECKSUM_OFFSET + 2
+    ] = checksum16(
+        data[header : header + HEADER_CHECKSUM_OFFSET]
+    ).to_bytes(2, "little")
 
 
 def save_after_recovery(
-    qemu: str, image: Path, recovered: bytes, replacement: bytes
-) -> None:
+    qemu: str,
+    image: Path,
+    recovered: tuple[tuple[bytes, bytes], ...],
+    replacement: bytes,
+) -> tuple[tuple[bytes, bytes], ...]:
+    filename, document = recovered[0]
     with QemuSession(qemu, image) as session:
         cursor = session.wait_for(b"nix> ", 0)
-        session.write(b"edit\r")
-        cursor = session.wait_for(b"edit\r\n" + EDITOR_FRAME + recovered, cursor)
+        command = b"edit " + filename
+        session.write(command + b"\r")
+        cursor = session.wait_for(
+            command + b"\r\n" + editor_frame(filename) + document, cursor
+        )
         session.write(b"\x0c")
-        cursor = session.wait_for(EDITOR_FRAME, cursor)
+        cursor = session.wait_for(editor_frame(filename), cursor)
         session.write(replacement + b"\x13")
         cursor = session.wait_for(
-            replacement + EDITOR_SAVED_FRAME + replacement, cursor
+            replacement + editor_frame(filename, b"Saved.") + replacement,
+            cursor,
         )
         session.write(b"\x18")
         cursor = session.wait_for(b"\r\nnix> ", cursor)
         halt(session, cursor)
-    assert_document_on_boot(qemu, image, replacement)
+    result = ((filename, replacement),) + recovered[1:]
+    assert_files_on_boot(qemu, image, result)
+    return result
 
 
 def exercise_recovery(
     qemu: str,
     source: Path,
     directory: Path,
-    older: bytes,
-    newest: bytes,
+    older: tuple[tuple[bytes, bytes], ...],
+    newest: tuple[tuple[bytes, bytes], ...],
 ) -> None:
     original = source.read_bytes()
+    newest_header = SNAPSHOT_OFFSETS[0]
+    newest_payload = newest_header + SECTOR_SIZE
     variants: dict[str, bytearray] = {}
-    newest_header = SLOT_HEADER_OFFSETS[1]
-    newest_payload = SLOT_PAYLOAD_OFFSETS[1]
 
     bad_payload = bytearray(original)
     bad_payload[newest_payload] ^= 0x01
@@ -657,39 +986,45 @@ def exercise_recovery(
     bad_magic[newest_header] ^= 0x01
     variants["newest-magic"] = bad_magic
 
-    bad_payload_crc = bytearray(original)
-    bad_payload_crc[newest_header + 8] ^= 0x01
-    variants["newest-payload-crc"] = bad_payload_crc
+    bad_file_crc = bytearray(original)
+    bad_file_crc[
+        newest_header + ENTRY_OFFSET + ENTRY_CHECKSUM_OFFSET
+    ] ^= 0x01
+    update_header_checksum(bad_file_crc, 0)
+    variants["newest-file-crc"] = bad_file_crc
 
     bad_header_crc = bytearray(original)
-    bad_header_crc[newest_header + 10] ^= 0x01
+    bad_header_crc[newest_header + HEADER_CHECKSUM_OFFSET] ^= 0x01
     variants["newest-header-crc"] = bad_header_crc
 
     bad_length = bytearray(original)
-    bad_length[newest_header + 6 : newest_header + 8] = (2048).to_bytes(
-        2, "little"
-    )
-    bad_length[newest_header + 10 : newest_header + 12] = checksum16(
-        bad_length[newest_header : newest_header + 10]
-    ).to_bytes(2, "little")
+    length = newest_header + ENTRY_OFFSET + ENTRY_LENGTH_OFFSET
+    bad_length[length : length + 2] = FILE_CAPACITY.to_bytes(2, "little")
+    update_header_checksum(bad_length, 0)
     variants["newest-oversized-length"] = bad_length
+
+    bad_count = bytearray(original)
+    bad_count[newest_header + 6] = MAX_FILES + 1
+    update_header_checksum(bad_count, 0)
+    variants["newest-oversized-count"] = bad_count
 
     for name, data in variants.items():
         write_variant(qemu, directory, name, data, older)
 
-    # Model every important interrupted-save state while a third save targets
-    # slot A. Slot B must remain the recoverable active version throughout.
-    candidate = build_record(2, b"candidate after interrupted save")
+    candidate_files = ((newest[0][0], b"candidate after interrupted save"),) + newest[1:]
+    candidate = build_snapshot(3, candidate_files)
     candidate_header = candidate[:SECTOR_SIZE]
     candidate_payload = candidate[SECTOR_SIZE:]
-    target_header = SLOT_HEADER_OFFSETS[0]
-    target_payload = SLOT_PAYLOAD_OFFSETS[0]
+    target_header = SNAPSHOT_OFFSETS[1]
+    target_payload = target_header + SECTOR_SIZE
 
     invalidated = bytearray(original)
     invalidated[target_header : target_header + SECTOR_SIZE] = bytes(SECTOR_SIZE)
-    write_variant(qemu, directory, "target-header-invalidated", invalidated, newest)
+    write_variant(
+        qemu, directory, "target-header-invalidated", invalidated, newest
+    )
 
-    for sectors in (2, 4):
+    for sectors in (2, 32):
         partial = bytearray(invalidated)
         count = sectors * SECTOR_SIZE
         partial[target_payload : target_payload + count] = candidate_payload[:count]
@@ -701,86 +1036,172 @@ def exercise_recovery(
             newest,
         )
 
-    for prefix in (1, 7, 10, 11):
+    for prefix in (1, 7, HEADER_CHECKSUM_OFFSET, HEADER_CHECKSUM_OFFSET + 1):
         torn = bytearray(invalidated)
-        torn[target_payload : target_payload + 2048] = candidate_payload
+        torn[target_payload : target_header + SNAPSHOT_SIZE] = candidate_payload
         torn[target_header : target_header + prefix] = candidate_header[:prefix]
-        write_variant(qemu, directory, f"target-header-prefix-{prefix}", torn, newest)
+        write_variant(
+            qemu, directory, f"target-header-prefix-{prefix}", torn, newest
+        )
 
     completed = bytearray(original)
-    install_record(completed, 0, candidate)
+    install_snapshot(completed, 1, candidate)
     write_variant(
-        qemu,
-        directory,
-        "completed-new-generation",
-        completed,
-        b"candidate after interrupted save",
+        qemu, directory, "completed-new-generation", completed, candidate_files
     )
 
-    newest_a_corrupt = bytearray(completed)
-    newest_a_corrupt[SLOT_PAYLOAD_OFFSETS[0]] ^= 0x01
-    fallback_image = directory / "recovery-newest-a-payload.img"
-    fallback_image.write_bytes(newest_a_corrupt)
-    assert_document_on_boot(qemu, fallback_image, newest)
+    newest_b_corrupt = bytearray(completed)
+    newest_b_corrupt[SNAPSHOT_OFFSETS[1] + SECTOR_SIZE] ^= 0x01
+    fallback_image = directory / "recovery-newest-b-payload.img"
+    fallback_image.write_bytes(newest_b_corrupt)
+    assert_files_on_boot(qemu, fallback_image, newest)
     recovered_replacement = b"saved after fallback recovery"
-    save_after_recovery(qemu, fallback_image, newest, recovered_replacement)
-    recovered = newest_record(fallback_image.read_bytes())
-    if recovered != (0, 2, recovered_replacement):
-        raise SmokeFailure(f"post-fallback save used wrong slot/generation: {recovered!r}")
+    recovered = save_after_recovery(
+        qemu, fallback_image, newest, recovered_replacement
+    )
+    parsed = newest_snapshot(fallback_image.read_bytes())
+    if parsed != (1, 3, recovered):
+        raise SmokeFailure(
+            f"post-fallback save used wrong snapshot/generation: {parsed!r}"
+        )
 
-    both_payloads_bad = bytearray(completed)
-    both_payloads_bad[SLOT_PAYLOAD_OFFSETS[0]] ^= 0x01
-    both_payloads_bad[SLOT_PAYLOAD_OFFSETS[1]] ^= 0x01
-    write_variant(qemu, directory, "both-payloads-invalid", both_payloads_bad, b"")
+    both_payloads_bad = bytearray(original)
+    both_payloads_bad[SNAPSHOT_OFFSETS[0] + SECTOR_SIZE] ^= 0x01
+    both_payloads_bad[SNAPSHOT_OFFSETS[1] + SECTOR_SIZE] ^= 0x01
+    write_variant(
+        qemu, directory, "both-payloads-invalid", both_payloads_bad, ()
+    )
 
     both_invalid = bytearray(original)
-    for offset in SLOT_HEADER_OFFSETS:
+    for offset in SNAPSHOT_OFFSETS:
         both_invalid[offset : offset + SECTOR_SIZE] = bytes(SECTOR_SIZE)
-    write_variant(qemu, directory, "both-slots-invalid", both_invalid, b"")
+    write_variant(qemu, directory, "both-snapshots-invalid", both_invalid, ())
 
 
-def exercise_generation_order(qemu: str, template: bytes, directory: Path) -> None:
+def exercise_generation_order(
+    qemu: str, template: bytes, directory: Path
+) -> None:
     cases = (
         ("wrap-to-b", 0xFFFF, b"A old", 0, b"B new", b"B new"),
         ("wrap-to-a", 0, b"A new", 0xFFFF, b"B old", b"A new"),
         ("equal-prefers-a", 7, b"A tie", 7, b"B tie", b"A tie"),
         ("half-range-prefers-a", 0x8000, b"A half", 0, b"B half", b"A half"),
     )
+    filename = b"WRAP.TXT"
     for name, generation_a, document_a, generation_b, document_b, expected in cases:
         image_data = bytearray(template)
-        install_record(image_data, 0, build_record(generation_a, document_a))
-        install_record(image_data, 1, build_record(generation_b, document_b))
-        write_variant(qemu, directory, name, image_data, expected)
+        install_snapshot(
+            image_data, 0, build_snapshot(generation_a, ((filename, document_a),))
+        )
+        install_snapshot(
+            image_data, 1, build_snapshot(generation_b, ((filename, document_b),))
+        )
+        write_variant(qemu, directory, name, image_data, ((filename, expected),))
 
     writer_wrap = bytearray(template)
-    install_record(writer_wrap, 0, build_record(0xFFFF, b"before writer wrap"))
+    before = ((filename, b"before writer wrap"),)
+    install_snapshot(writer_wrap, 0, build_snapshot(0xFFFF, before))
     writer_image = directory / "generation-writer-wrap.img"
     writer_image.write_bytes(writer_wrap)
-    save_after_recovery(
-        qemu, writer_image, b"before writer wrap", b"after writer wrap"
-    )
-    wrapped = newest_record(writer_image.read_bytes())
-    if wrapped != (1, 0, b"after writer wrap"):
+    after = save_after_recovery(qemu, writer_image, before, b"after writer wrap")
+    wrapped = newest_snapshot(writer_image.read_bytes())
+    if wrapped != (1, 0, after):
         raise SmokeFailure(f"writer generation did not wrap correctly: {wrapped!r}")
 
 
-def save_empty_and_verify_restart(qemu: str, image: Path, expected: bytes) -> None:
-    with QemuSession(qemu, image) as session:
-        cursor = session.wait_for(b"nix> ", 0)
-        session.write(b"edit\r")
-        cursor = session.wait_for(b"edit\r\n" + EDITOR_FRAME + expected, cursor)
-        session.write(b"\x0c")
-        cursor = session.wait_for(EDITOR_FRAME, cursor)
-        session.write(b"\x13")
-        cursor = session.wait_for(EDITOR_SAVED_FRAME, cursor)
-        session.write(b"\x18")
-        cursor = session.wait_for(b"\r\nnix> ", cursor)
-        halt(session, cursor)
+def exercise_legacy_recovery(
+    qemu: str, template: bytes, directory: Path
+) -> None:
+    older = b"legacy older text"
+    newest = b"legacy BASIC or text survives"
+    image_data = bytearray(template)
+    install_legacy_record(image_data, 0, build_legacy_record(4, older))
+    install_legacy_record(image_data, 1, build_legacy_record(5, newest))
+    image = directory / "legacy-nix2.img"
+    image.write_bytes(image_data)
+    expected = ((b"UNTITLED.TXT", newest),)
+    assert_files_on_boot(qemu, image, expected)
+
+    replacement = newest + b"!"
+    converted = save_after_recovery(qemu, image, expected, replacement)
+    assert_saved_snapshot(
+        image,
+        converted,
+        template,
+        expected_slot=0,
+        expected_generation=6,
+    )
+
+
+def exercise_storage_full(
+    qemu: str, template: bytes, directory: Path
+) -> None:
+    files = tuple(
+        (f"FILE{index}.TXT".encode(), f"document {index}".encode())
+        for index in range(1, MAX_FILES + 1)
+    )
+    image_data = bytearray(template)
+    install_snapshot(image_data, 0, build_snapshot(7, files))
+    image = directory / "storage-full.img"
+    image.write_bytes(image_data)
+    before = image.read_bytes()
 
     with QemuSession(qemu, image) as session:
         cursor = session.wait_for(b"nix> ", 0)
-        cursor = assert_editor_document(session, b"", cursor)
+        cursor = assert_files(
+            session, tuple(filename for filename, _ in files), cursor
+        )
+        filename = b"NINTH.BAS"
+        command = b"edit ninth.bas"
+        session.write(command + b"\r")
+        cursor = session.wait_for(
+            command + b"\r\n" + editor_frame(filename), cursor
+        )
+        session.write(b'10 print "FULL"\x13')
+        cursor = session.wait_for(
+            b'10 print "FULL"'
+            + editor_frame(filename, b"Storage full.")
+            + b'10 print "FULL"',
+            cursor,
+        )
+        session.write(b"\x18reboot\r")
+        cursor = session.wait_for(
+            b"\r\nnix> reboot\r\nRebooting...\r\n", cursor
+        )
+        cursor = session.wait_for(
+            b"Nixodria OS\r\nType help.\r\nnix> ", cursor
+        )
+        cursor = assert_files(
+            session, tuple(filename for filename, _ in files), cursor
+        )
         halt(session, cursor)
+    if image.read_bytes() != before:
+        raise SmokeFailure("ninth-file save changed a full filesystem")
+
+
+def save_empty_and_verify_restart(
+    qemu: str,
+    image: Path,
+    expected: tuple[tuple[bytes, bytes], ...],
+) -> tuple[tuple[bytes, bytes], ...]:
+    filename, document = expected[0]
+    with QemuSession(qemu, image) as session:
+        cursor = session.wait_for(b"nix> ", 0)
+        command = b"edit " + filename
+        session.write(command + b"\r")
+        cursor = session.wait_for(
+            command + b"\r\n" + editor_frame(filename) + document, cursor
+        )
+        session.write(b"\x0c")
+        cursor = session.wait_for(editor_frame(filename), cursor)
+        session.write(b"\x13")
+        cursor = session.wait_for(editor_frame(filename, b"Saved."), cursor)
+        session.write(b"\x18")
+        cursor = session.wait_for(b"\r\nnix> ", cursor)
+        halt(session, cursor)
+    result = ((filename, b""),) + expected[1:]
+    assert_files_on_boot(qemu, image, result)
+    return result
 
 
 def main() -> int:
@@ -797,75 +1218,110 @@ def main() -> int:
 
     try:
         source_before = source_image.read_bytes()
-        system = source_before[:STORAGE_OFFSET]
+        if len(source_before) != IMAGE_SIZE:
+            raise SmokeFailure(
+                f"source image is {len(source_before)} bytes; expected {IMAGE_SIZE}"
+            )
         with tempfile.TemporaryDirectory(prefix="nixodria-smoke-") as directory:
             root = Path(directory)
+
             basic_image = root / "basic.img"
             shutil.copyfile(source_image, basic_image)
-            exercise_basic(qemu, basic_image)
+            exercise_basic(qemu, basic_image, source_before)
+
+            filename_image = root / "filenames.img"
+            shutil.copyfile(source_image, filename_image)
+            exercise_filename_rules(qemu, filename_image)
+            if filename_image.read_bytes() != source_before:
+                raise SmokeFailure("unsaved filename checks changed their image")
 
             runtime_image = root / "nixodria.img"
             shutil.copyfile(source_image, runtime_image)
-
-            full_document = exercise_editor_and_save(qemu, runtime_image)
-            first_save = assert_saved_record(
+            notes = exercise_first_named_file(qemu, runtime_image)
+            first_files = ((b"NOTES.TXT", notes),)
+            first_save = assert_saved_snapshot(
                 runtime_image,
-                full_document,
-                system,
+                first_files,
+                source_before,
                 expected_slot=0,
                 expected_generation=0,
             )
-            if any(first_save[SLOT_HEADER_OFFSETS[1] :]):
-                raise SmokeFailure("first save unexpectedly changed slot B")
+            if any(
+                first_save[
+                    SNAPSHOT_OFFSETS[1] : SNAPSHOT_OFFSETS[1] + SNAPSHOT_SIZE
+                ]
+            ):
+                raise SmokeFailure("first save unexpectedly changed snapshot B")
 
-            replacement = exercise_process_restart(qemu, runtime_image, full_document)
-            second_save = assert_saved_record(
+            basic_program = exercise_second_named_file(qemu, runtime_image, notes)
+            second_files = first_files + ((b"COUNT.BAS", basic_program),)
+            second_save = assert_saved_snapshot(
                 runtime_image,
-                replacement,
-                system,
+                second_files,
+                source_before,
                 expected_slot=1,
                 expected_generation=1,
             )
-            first_slot = slice(SLOT_HEADER_OFFSETS[0], SLOT_HEADER_OFFSETS[0] + SLOT_SIZE)
-            if second_save[first_slot] != first_save[first_slot]:
-                raise SmokeFailure("second save changed the active fallback slot")
-
-            readonly_image = Path(directory) / "readonly.img"
-            shutil.copyfile(runtime_image, readonly_image)
-            exercise_readonly_failure(qemu, readonly_image, replacement)
-            exercise_injected_write_failures(
-                qemu, runtime_image, root, replacement
+            snapshot_a = slice(
+                SNAPSHOT_OFFSETS[0], SNAPSHOT_OFFSETS[0] + SNAPSHOT_SIZE
             )
+            if second_save[snapshot_a] != first_save[snapshot_a]:
+                raise SmokeFailure("second save changed the active fallback snapshot")
 
-            exercise_recovery(
-                qemu,
-                runtime_image,
-                root,
-                full_document,
-                replacement,
+            replacement = exercise_process_restart(
+                qemu, runtime_image, basic_program
             )
-            exercise_generation_order(qemu, source_before, root)
-
-            save_empty_and_verify_restart(qemu, runtime_image, replacement)
-            third_save = assert_saved_record(
+            newest_files = (
+                (b"NOTES.TXT", replacement),
+                (b"COUNT.BAS", basic_program),
+            )
+            third_save = assert_saved_snapshot(
                 runtime_image,
-                b"",
-                system,
+                newest_files,
+                source_before,
                 expected_slot=0,
                 expected_generation=2,
             )
-            second_slot = slice(SLOT_HEADER_OFFSETS[1], SLOT_HEADER_OFFSETS[1] + SLOT_SIZE)
-            if third_save[second_slot] != second_save[second_slot]:
-                raise SmokeFailure("third save changed the active fallback slot")
+            snapshot_b = slice(
+                SNAPSHOT_OFFSETS[1], SNAPSHOT_OFFSETS[1] + SNAPSHOT_SIZE
+            )
+            if third_save[snapshot_b] != second_save[snapshot_b]:
+                raise SmokeFailure("third save changed the active fallback snapshot")
+
+            readonly_image = root / "readonly.img"
+            shutil.copyfile(runtime_image, readonly_image)
+            exercise_readonly_failure(qemu, readonly_image, newest_files)
+            exercise_injected_write_failures(
+                qemu, runtime_image, root, newest_files
+            )
+            exercise_recovery(
+                qemu, runtime_image, root, second_files, newest_files
+            )
+            exercise_generation_order(qemu, source_before, root)
+            exercise_legacy_recovery(qemu, source_before, root)
+            exercise_storage_full(qemu, source_before, root)
+
+            empty_files = save_empty_and_verify_restart(
+                qemu, runtime_image, newest_files
+            )
+            fourth_save = assert_saved_snapshot(
+                runtime_image,
+                empty_files,
+                source_before,
+                expected_slot=1,
+                expected_generation=3,
+            )
+            if fourth_save[snapshot_a] != third_save[snapshot_a]:
+                raise SmokeFailure("fourth save changed the active fallback snapshot")
 
         if source_image.read_bytes() != source_before:
             raise SmokeFailure("smoke test modified the source build image")
-    except (BrokenPipeError, OSError, SmokeFailure) as error:
+    except (BrokenPipeError, OSError, SmokeFailure, ValueError) as error:
         print(f"smoke: {error}", file=sys.stderr)
         return 1
 
     print(
-        "smoke: BASIC, editor persistence, recovery, and write faults passed"
+        "smoke: named files, BASIC, persistence, recovery, and write faults passed"
     )
     return 0
 
