@@ -16,7 +16,7 @@ class SmokeFailure(RuntimeError):
 
 
 SECTOR_SIZE = 512
-SYSTEM_SECTORS = 4
+SYSTEM_SECTORS = 8
 SLOT_SECTORS = 5
 SLOT_SIZE = SLOT_SECTORS * SECTOR_SIZE
 STORAGE_OFFSET = SYSTEM_SECTORS * SECTOR_SIZE
@@ -29,11 +29,13 @@ CLEAR_SCREEN = b"\x1b[2J\x1b[H"
 EDITOR_HEADER = (
     CLEAR_SCREEN
     + b"Nixodria Editor\r\n"
-    + b"Ctrl-S save | Ctrl-X exit | Ctrl-L clear\r\n"
+    + b"Ctrl-S save | Ctrl-R run | Ctrl-X exit | Ctrl-L clear\r\n"
 )
 EDITOR_FRAME = EDITOR_HEADER + b"\r\n"
 EDITOR_SAVED_FRAME = EDITOR_HEADER + b"Saved.\r\n\r\n"
 EDITOR_FAILED_FRAME = EDITOR_HEADER + b"Save failed.\r\n\r\n"
+BASIC_FRAME = CLEAR_SCREEN + b"Nixodria BASIC\r\n\r\n"
+BASIC_FINISHED = b"\r\nProgram finished. Press any key."
 
 
 class QemuSession:
@@ -270,6 +272,125 @@ def assert_saved_record(
     return data
 
 
+def exercise_basic(qemu: str, image: Path) -> None:
+    program = (
+        b"10 rem keywords are case insensitive\r\n"
+        b"20 print a\r\n"
+        b"30 let a = -2\r\n"
+        b"40 print \"COUNT\"\r\n"
+        b"50 print a\r\n"
+        b"60 let a = a + 1\r\n"
+        b"70 if a < 1 then 50\r\n"
+        b"80 if a = 1 then 100\r\n"
+        b"90 print \"BAD\"\r\n"
+        b"100 if a > 0 then 120\r\n"
+        b"110 print \"BAD\"\r\n"
+        b"120 goto 140\r\n"
+        b"130 print \"BAD\"\r\n"
+        b"140 end"
+    )
+    output = b"0\r\nCOUNT\r\n-2\r\n-1\r\n0\r\n"
+    successful_run = BASIC_FRAME + output + BASIC_FINISHED
+    original = image.read_bytes()
+
+    # Ctrl-R executes unsaved source and returns to the unchanged editor. It
+    # must not write any part of the disk image.
+    with QemuSession(qemu, image) as session:
+        cursor = session.wait_for(b"nix> ", 0)
+        session.write(b"edit\r")
+        cursor = session.wait_for(b"edit\r\n" + EDITOR_FRAME, cursor)
+        session.write(program + b"\x12")
+        cursor = session.wait_for(program + successful_run, cursor)
+        session.write(b" ")
+        cursor = session.wait_for(EDITOR_FRAME + program, cursor)
+        session.write(b"\x18")
+        cursor = session.wait_for(b"\r\nnix> ", cursor)
+        halt(session, cursor)
+    if image.read_bytes() != original:
+        raise SmokeFailure("running unsaved BASIC changed the disk image")
+
+    # Save the source, run it, reboot, and run it again. Identical output also
+    # proves that variables are reset at the beginning of each execution.
+    with QemuSession(qemu, image) as session:
+        cursor = session.wait_for(b"nix> ", 0)
+        session.write(b"edit\r")
+        cursor = session.wait_for(b"edit\r\n" + EDITOR_FRAME, cursor)
+        session.write(program + b"\x13")
+        cursor = session.wait_for(program + EDITOR_SAVED_FRAME + program, cursor)
+        session.write(b"\x12")
+        cursor = session.wait_for(successful_run, cursor)
+        session.write(b" ")
+        cursor = session.wait_for(EDITOR_FRAME + program, cursor)
+        session.write(b"\x18reboot\r")
+        cursor = session.wait_for(b"\r\nnix> reboot\r\nRebooting...\r\n", cursor)
+        cursor = session.wait_for(b"Nixodria OS\r\nType help.\r\nnix> ", cursor)
+        session.write(b"edit\r")
+        cursor = session.wait_for(b"edit\r\n" + EDITOR_FRAME + program, cursor)
+        session.write(b"\x12")
+        cursor = session.wait_for(successful_run, cursor)
+        session.write(b" ")
+        cursor = session.wait_for(EDITOR_FRAME + program, cursor)
+
+        # A missing jump target reports the executing line and returns safely.
+        missing_line = b'10 print "BEFORE"\r\n20 goto 999'
+        session.write(b"\x0c")
+        cursor = session.wait_for(EDITOR_FRAME, cursor)
+        session.write(missing_line + b"\x12")
+        cursor = session.wait_for(
+            missing_line
+            + BASIC_FRAME
+            + b"BEFORE\r\n\r\nBASIC error at line 20. Press any key.",
+            cursor,
+        )
+        # CRLF dismissal must not insert a newline into the editor source.
+        session.write(b"\r\n")
+        cursor = session.wait_for(EDITOR_FRAME + missing_line, cursor)
+
+        # Decimal input outside the supported 16-bit range is rejected rather
+        # than wrapping to another value or line number.
+        overflow_program = b"10 print 65536"
+        session.write(b"\x0c")
+        cursor = session.wait_for(EDITOR_FRAME, cursor)
+        session.write(overflow_program + b"\x12")
+        cursor = session.wait_for(
+            overflow_program
+            + BASIC_FRAME
+            + b"\r\nBASIC error at line 10. Press any key.",
+            cursor,
+        )
+        session.write(b" ")
+        cursor = session.wait_for(EDITOR_FRAME + overflow_program, cursor)
+        session.write(b"\x18reboot\r")
+        cursor = session.wait_for(b"\r\nnix> reboot\r\nRebooting...\r\n", cursor)
+        cursor = session.wait_for(b"Nixodria OS\r\nType help.\r\nnix> ", cursor)
+
+        # The bounded execution guard breaks an accidental infinite loop.
+        session.write(b"edit\r")
+        cursor = session.wait_for(b"edit\r\n" + EDITOR_FRAME + program, cursor)
+        guard_program = b"10 goto 10"
+        session.write(b"\x0c")
+        cursor = session.wait_for(EDITOR_FRAME, cursor)
+        session.write(guard_program + b"\x12")
+        cursor = session.wait_for(
+            guard_program
+            + BASIC_FRAME
+            + b"\r\nBASIC error at line 10. Press any key.",
+            cursor,
+            timeout=10.0,
+        )
+        session.write(b" ")
+        cursor = session.wait_for(EDITOR_FRAME + guard_program, cursor)
+        session.write(b"\x18reboot\r")
+        cursor = session.wait_for(b"\r\nnix> reboot\r\nRebooting...\r\n", cursor)
+        cursor = session.wait_for(b"Nixodria OS\r\nType help.\r\nnix> ", cursor)
+        cursor = assert_editor_document(session, program, cursor)
+        halt(session, cursor)
+
+    newest = newest_record(image.read_bytes())
+    if newest != (0, 0, program):
+        raise SmokeFailure(f"saved BASIC program changed unexpectedly: {newest!r}")
+
+
 def exercise_editor_and_save(qemu: str, image: Path) -> bytes:
     full_document = b"A" * 510 + b"\r\n" + b"B" * 512 + b"C" * 512 + b"D" * 511
     with QemuSession(qemu, image) as session:
@@ -413,19 +534,19 @@ def exercise_injected_write_failures(
     original = source.read_bytes()
     slot_b = slice(SLOT_HEADER_OFFSETS[1], SLOT_HEADER_OFFSETS[1] + SLOT_SIZE)
     configurations = {
-        "invalidation": """
+        "invalidation": f"""
 [inject-error]
 event = "write_aio"
 errno = "5"
-sector = "4"
+sector = "{SYSTEM_SECTORS}"
 """,
-        "second-payload-sector": """
+        "second-payload-sector": f"""
 [inject-error]
 event = "write_aio"
 errno = "5"
-sector = "6"
+sector = "{SYSTEM_SECTORS + 2}"
 """,
-        "final-header": """
+        "final-header": f"""
 [set-state]
 event = "write_aio"
 state = "1"
@@ -435,7 +556,7 @@ new_state = "2"
 event = "write_aio"
 state = "2"
 errno = "5"
-sector = "4"
+sector = "{SYSTEM_SECTORS}"
 """,
     }
 
@@ -676,7 +797,12 @@ def main() -> int:
         source_before = source_image.read_bytes()
         system = source_before[:STORAGE_OFFSET]
         with tempfile.TemporaryDirectory(prefix="nixodria-smoke-") as directory:
-            runtime_image = Path(directory) / "nixodria.img"
+            root = Path(directory)
+            basic_image = root / "basic.img"
+            shutil.copyfile(source_image, basic_image)
+            exercise_basic(qemu, basic_image)
+
+            runtime_image = root / "nixodria.img"
             shutil.copyfile(source_image, runtime_image)
 
             full_document = exercise_editor_and_save(qemu, runtime_image)
@@ -706,17 +832,17 @@ def main() -> int:
             shutil.copyfile(runtime_image, readonly_image)
             exercise_readonly_failure(qemu, readonly_image, replacement)
             exercise_injected_write_failures(
-                qemu, runtime_image, Path(directory), replacement
+                qemu, runtime_image, root, replacement
             )
 
             exercise_recovery(
                 qemu,
                 runtime_image,
-                Path(directory),
+                root,
                 full_document,
                 replacement,
             )
-            exercise_generation_order(qemu, source_before, Path(directory))
+            exercise_generation_order(qemu, source_before, root)
 
             save_empty_and_verify_restart(qemu, runtime_image, replacement)
             third_save = assert_saved_record(
@@ -737,7 +863,7 @@ def main() -> int:
         return 1
 
     print(
-        "smoke: editor persistence, restart, corruption recovery, and write faults passed"
+        "smoke: BASIC, editor persistence, recovery, and write faults passed"
     )
     return 0
 

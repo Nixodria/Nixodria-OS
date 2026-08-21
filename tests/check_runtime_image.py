@@ -10,10 +10,14 @@ import tempfile
 
 
 SECTOR_SIZE = 512
-SYSTEM_SECTORS = 4
+SYSTEM_SECTORS = 8
 STORAGE_SECTORS = 10
+LEGACY_SYSTEM_SECTORS = 4
 SYSTEM_SIZE = SECTOR_SIZE * SYSTEM_SECTORS
+STORAGE_SIZE = SECTOR_SIZE * STORAGE_SECTORS
 IMAGE_SIZE = SECTOR_SIZE * (SYSTEM_SECTORS + STORAGE_SECTORS)
+LEGACY_SYSTEM_SIZE = SECTOR_SIZE * LEGACY_SYSTEM_SECTORS
+LEGACY_IMAGE_SIZE = SECTOR_SIZE * (LEGACY_SYSTEM_SECTORS + STORAGE_SECTORS)
 
 
 def run_preparer(preparer: Path, template: Path, runtime: Path) -> None:
@@ -26,6 +30,17 @@ def run_preparer(preparer: Path, template: Path, runtime: Path) -> None:
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip()
         raise RuntimeError(f"runtime preparer failed: {detail}")
+
+
+def assert_preparer_fails(preparer: Path, template: Path, runtime: Path) -> None:
+    result = subprocess.run(
+        [sys.executable, str(preparer), str(template), str(runtime)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        raise RuntimeError(f"invalid runtime image was accepted: {runtime}")
 
 
 def main() -> int:
@@ -83,26 +98,65 @@ def main() -> int:
             if stat.S_IMODE(runtime.stat().st_mode) != 0o600:
                 raise RuntimeError("refreshed runtime image is not private mode 0600")
 
+            legacy = root / "legacy.img"
+            legacy_storage = bytes(
+                (index * 19 + 7) & 0xFF for index in range(STORAGE_SIZE)
+            )
+            legacy_data = template_data[:LEGACY_SYSTEM_SIZE] + legacy_storage
+            if len(legacy_data) != LEGACY_IMAGE_SIZE:
+                raise RuntimeError("legacy migration fixture has the wrong size")
+            legacy.write_bytes(legacy_data)
+            os.chmod(legacy, 0o644)
+            run_preparer(preparer, template, legacy)
+
+            migrated = legacy.read_bytes()
+            expected_migration = bytes(refreshed_template[:SYSTEM_SIZE]) + legacy_storage
+            if migrated != expected_migration:
+                raise RuntimeError("legacy migration did not preserve its storage sectors")
+            if stat.S_IMODE(legacy.stat().st_mode) != 0o600:
+                raise RuntimeError("migrated runtime image is not private mode 0600")
+
+            run_preparer(preparer, template, legacy)
+            if legacy.read_bytes() != expected_migration:
+                raise RuntimeError("second refresh changed the migrated runtime image")
+
             malformed = root / "malformed.img"
             malformed_bytes = b"existing state must not be overwritten"
             malformed.write_bytes(malformed_bytes)
-            failed = subprocess.run(
-                [sys.executable, str(preparer), str(template), str(malformed)],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            if failed.returncode == 0:
-                raise RuntimeError("malformed runtime image was accepted")
+            assert_preparer_fails(preparer, template, malformed)
             if malformed.read_bytes() != malformed_bytes:
                 raise RuntimeError("failed refresh overwrote malformed runtime state")
+
+            unsigned_legacy = root / "unsigned-legacy.img"
+            unsigned_data = bytes(LEGACY_IMAGE_SIZE)
+            unsigned_legacy.write_bytes(unsigned_data)
+            assert_preparer_fails(preparer, template, unsigned_legacy)
+            if unsigned_legacy.read_bytes() != unsigned_data:
+                raise RuntimeError("failed legacy migration changed its runtime image")
+
+            symlink_target = root / "symlink-target.img"
+            symlink_target.write_bytes(template_data)
+            symlink = root / "runtime-symlink.img"
+            symlink.symlink_to(symlink_target)
+            assert_preparer_fails(preparer, template, symlink)
+            if not symlink.is_symlink() or symlink_target.read_bytes() != template_data:
+                raise RuntimeError("failed symlink refresh changed its target")
+
+            missing_target = root / "missing-target.img"
+            broken_symlink = root / "broken-runtime-symlink.img"
+            broken_symlink.symlink_to(missing_target)
+            assert_preparer_fails(preparer, template, broken_symlink)
+            if not broken_symlink.is_symlink() or missing_target.exists():
+                raise RuntimeError("failed broken-symlink refresh created its target")
+            if template.read_bytes() != bytes(refreshed_template):
+                raise RuntimeError("runtime checks changed their template")
         if source.read_bytes() != template_data:
             raise RuntimeError("runtime checks changed the source build image")
     except (OSError, RuntimeError) as error:
         print(f"runtime-check: {error}", file=sys.stderr)
         return 1
 
-    print("runtime-check: system refresh preserved all persistent storage bytes")
+    print("runtime-check: refresh and legacy migration preserved persistent storage")
     return 0
 
 

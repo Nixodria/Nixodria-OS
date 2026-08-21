@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Refresh boot code while preserving Nixodria's runtime document sectors."""
+"""Refresh boot code and migrate or preserve Nixodria's document sectors."""
 
 import os
 from pathlib import Path
@@ -8,10 +8,13 @@ import tempfile
 
 
 SECTOR_SIZE = 512
-SYSTEM_SECTORS = 4
+SYSTEM_SECTORS = 8
 STORAGE_SECTORS = 10
+LEGACY_SYSTEM_SECTORS = 4
 SYSTEM_SIZE = SECTOR_SIZE * SYSTEM_SECTORS
+STORAGE_SIZE = SECTOR_SIZE * STORAGE_SECTORS
 IMAGE_SIZE = SECTOR_SIZE * (SYSTEM_SECTORS + STORAGE_SECTORS)
+LEGACY_IMAGE_SIZE = SECTOR_SIZE * (LEGACY_SYSTEM_SECTORS + STORAGE_SECTORS)
 
 
 class ImageError(RuntimeError):
@@ -30,6 +33,23 @@ def read_image(path: Path, label: str) -> bytes:
     if data[SECTOR_SIZE - 2 : SECTOR_SIZE] != b"\x55\xaa":
         raise ImageError(f"{label} {path} has no BIOS signature")
     return data
+
+
+def read_runtime_image(path: Path) -> tuple[bytes, bool]:
+    try:
+        data = path.read_bytes()
+    except OSError as error:
+        raise ImageError(f"cannot read runtime image {path}: {error}") from error
+
+    if len(data) not in (IMAGE_SIZE, LEGACY_IMAGE_SIZE):
+        raise ImageError(
+            f"runtime image {path} is {len(data)} bytes; expected {IMAGE_SIZE} "
+            f"or legacy {LEGACY_IMAGE_SIZE}"
+        )
+    if data[SECTOR_SIZE - 2 : SECTOR_SIZE] != b"\x55\xaa":
+        raise ImageError(f"runtime image {path} has no BIOS signature")
+
+    return data, len(data) == LEGACY_IMAGE_SIZE
 
 
 def replace_atomically(path: Path, data: bytes) -> None:
@@ -61,9 +81,12 @@ def prepare_runtime_image(template: Path, runtime: Path) -> str:
 
     runtime_data: bytes | None = None
     if runtime.exists():
-        runtime_data = read_image(runtime, "runtime image")
-        combined = template_data[:SYSTEM_SIZE] + runtime_data[SYSTEM_SIZE:]
-        action = "updated system sectors and preserved saved text in"
+        runtime_data, legacy = read_runtime_image(runtime)
+        combined = template_data[:SYSTEM_SIZE] + runtime_data[-STORAGE_SIZE:]
+        if legacy:
+            action = "migrated legacy image and preserved saved text in"
+        else:
+            action = "updated system sectors and preserved saved text in"
     else:
         combined = template_data
         action = "created"
