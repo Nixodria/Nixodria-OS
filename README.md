@@ -1,6 +1,6 @@
 # Nixodria OS
 
-Nixodria OS is a tiny bootable x86 command-line operating system. Its first
+Nixodria OS is a bootable x86 command-line operating system. Its first
 512-byte BIOS sector loads a three-sector real-mode kernel. Ten more sectors
 hold two alternating copies of the text editor's durable document, producing a
 7 KiB image. The kernel starts a serial console without a general filesystem,
