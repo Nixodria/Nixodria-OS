@@ -5,8 +5,9 @@ Nixodria OS is a bootable x86 command-line operating system. Its first
 1.44 MiB floppy image. A small flat file store holds up to eight named text or
 BASIC files in two alternating recovery snapshots. The kernel starts a serial
 console without processes or a general-purpose filesystem. A demand-loaded
-native module provides the small network stack and rasterizer used for direct
-IPP printing.
+module provides the BASIC interpreter, while another supplies the small network
+stack and rasterizer used for direct IPP printing. The image also bundles an
+editable Tetris program written entirely in Nixodria BASIC.
 
 ## Commands
 
@@ -14,6 +15,7 @@ IPP printing.
 - `files` — list saved files by name
 - `edit <filename>` — open an existing file or start a new one
 - `edit` — open `UNTITLED.TXT` for compatibility
+- `run <filename>` — run a saved or bundled BASIC source file
 - `print <filename>` — rasterize and queue a saved file on the configured printer
 - `printer` — show the configured printer IPv4 address
 - `printer <IPv4>` — set the printer address for the current boot
@@ -54,24 +56,63 @@ does not save implicitly. Program output is shown on the serial console, and a
 syntax or runtime error stops the program and returns safely to the editor
 without changing its source.
 
+## Tetris
+
+Start the bundled game directly from the shell:
+
+```text
+run TETRIS.BAS
+```
+
+The 10-by-20 board uses `0` for an empty cell and `1` for a filled cell. The
+status below it shows the score (`S`) and cleared-line count (`L`). Controls are:
+
+- `a` / `d` — move left / right
+- `w` — rotate clockwise
+- `s` — soft drop
+- Space — hard drop
+- `q` — end the game; press any key at the BASIC completion prompt to return
+- `r` — restart after game over
+
+All tetromino rules, collision checks, line compaction, scoring, and game state
+live in [`apps/TETRIS.BAS`](apps/TETRIS.BAS), not native assembly. Run
+`edit TETRIS.BAS` to inspect or change the bundled source. If no saved file has
+that name, the editor loads the bundled copy; Control-S creates a normal
+persistent user override, which subsequent `edit` and `run` commands prefer.
+
 ## BASIC
 
 Nixodria implements a deliberately small, case-insensitive, line-numbered BASIC
-subset. Every statement starts with a decimal line number from 0 through 65535.
-Supported statements are:
+subset. Every physical line starts with a decimal line number from 0 through
+65535. Supported statements are:
 
-- `PRINT "text"` or `PRINT expression`
-- `LET A = expression`, using one-letter variables `A` through `Z`
+- `PRINT "text"` or `PRINT expression`; a trailing `;` suppresses the newline
+- `LET A = expression`, using one-letter variables `A` through `Z`; `LET` is
+  optional
+- `DIM A(max)` plus indexed `A(expression)` reads and assignments for one array
 - `IF expression = expression THEN line`, with `<` and `>` also supported
 - `GOTO line`
+- `GOSUB line` and `RETURN`, with at most 16 nested calls
+- `CLS` to clear the serial terminal
+- `KEY A` to store one pending input byte in `A`, or zero when none is ready
+- `WAIT expression` to pause for a positive number of BIOS timer ticks
+- `TIMER A` to store the low 16 bits of the BIOS tick counter in `A`
 - `REM` followed by a comment
 - `END`
 
-Expressions contain signed 16-bit integer literals or variables joined with
-`+` and `-`. Variables start at zero and are reset each time Control-R starts a
-program. Lines execute in the order written, and `GOTO` or `THEN` uses the
-first matching line number. Execution stops with a runtime error after 10,000
-statements, so an accidental infinite loop returns control to the editor.
+Expressions use signed 16-bit integers, scalars, array elements, and
+parentheses. Multiplication, division, and `MOD` bind before `+` and `-`; the
+bitwise `AND` operator binds after arithmetic. Division truncates toward zero,
+and division by zero is a runtime error. Scalars and the declared array start
+at zero on every run. An array's inclusive maximum index can be 0 through 255.
+
+Physical lines execute in source order and may contain multiple statements
+separated by colons. `GOTO`, `GOSUB`, and `THEN` use the first matching line
+number. A program may execute 10,000 statements without yielding; each
+successful `WAIT` starts a fresh allowance so interactive programs can keep
+running while an accidental tight loop still returns a runtime error. One BIOS
+tick is approximately 55 ms. `KEY` reads raw COM1 bytes without echo, and
+`TIMER` values can appear negative because BASIC integers are signed words.
 
 For example:
 
@@ -87,8 +128,7 @@ For example:
 
 Each BASIC file can contain a program of at most 2,047 bytes. The flat file
 store does not provide rename or delete operations. This BASIC subset does not
-provide interactive input, string variables, `FOR`/`NEXT`, arrays, functions,
-multiplication, division, parentheses, or multiple statements on one line.
+provide string variables, `FOR`/`NEXT`, functions, or more than one array.
 
 ## Native printing
 
@@ -147,10 +187,11 @@ no parity, and one stop bit. The run target also creates a fixed NE2000 ISA
 adapter at I/O `0x300` with QEMU user-mode networking so the guest can reach a
 printer on the host's LAN.
 
-The reproducible blank image is `build/nixodria.img`. `make run` boots the
-gitignored `.nixodria/nixodria.img` runtime copy. Normal rebuilds refresh only
-its boot, kernel, and native print-module sectors while preserving every saved
-file; `make clean` also leaves this runtime copy intact. When an older
+The reproducible blank-snapshot image is `build/nixodria.img`. `make run` boots
+the gitignored `.nixodria/nixodria.img` runtime copy. Normal rebuilds refresh
+only its boot, kernel, BASIC and print modules, bundled application source, and
+unused sectors while preserving every saved file; `make clean` also leaves this
+runtime copy intact. When an older
 single-document runtime image is first refreshed, its last valid save
 immediately appears as `UNTITLED.TXT`; the next save converts the disk record to
 the named-file format.

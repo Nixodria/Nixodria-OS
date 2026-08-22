@@ -6,6 +6,8 @@ BUILD_DIR := build
 IMAGE := $(BUILD_DIR)/nixodria.img
 BASE_IMAGE := $(BUILD_DIR)/nixodria-base.img
 PRINT_MODULE := $(BUILD_DIR)/print.bin
+BASIC_MODULE := $(BUILD_DIR)/basic.bin
+TETRIS_SOURCE := apps/TETRIS.BAS
 RUNTIME_DIR := .nixodria
 RUNTIME_IMAGE := $(RUNTIME_DIR)/nixodria.img
 
@@ -22,8 +24,13 @@ $(BASE_IMAGE): src/boot.asm | $(BUILD_DIR)
 $(PRINT_MODULE): src/print.asm | $(BUILD_DIR)
 	$(ASM) -f bin -Wall -Wno-reloc-abs-word -Werror "$<" -o "$@"
 
-$(IMAGE): $(BASE_IMAGE) $(PRINT_MODULE) tools/build_image.py
-	$(PYTHON) tools/build_image.py "$(BASE_IMAGE)" "$(PRINT_MODULE)" "$@"
+$(BASIC_MODULE): src/basic.asm | $(BUILD_DIR)
+	$(ASM) -f bin -Wall -Wno-reloc-abs-word -Werror "$<" -o "$@"
+
+$(IMAGE): $(BASE_IMAGE) $(PRINT_MODULE) $(BASIC_MODULE) $(TETRIS_SOURCE) \
+	tools/build_image.py
+	$(PYTHON) tools/build_image.py "$(BASE_IMAGE)" "$(PRINT_MODULE)" \
+		"$(BASIC_MODULE)" "$(TETRIS_SOURCE)" "$@"
 
 check: $(IMAGE)
 	$(PYTHON) tests/check_image.py "$(IMAGE)"
