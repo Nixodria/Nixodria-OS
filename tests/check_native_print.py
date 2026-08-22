@@ -157,7 +157,11 @@ def _read_http_request(connection: socket.socket) -> HTTPRequest:
 
 
 class FakeIPPServer:
-    def __init__(self, ipp_status: int = IPP_SUCCESSFUL_OK) -> None:
+    def __init__(
+        self,
+        ipp_status: int = IPP_SUCCESSFUL_OK,
+        raw_response: bytes | None = None,
+    ) -> None:
         if not 0 <= ipp_status <= 0xFFFF:
             raise ValueError(f"invalid IPP status 0x{ipp_status:x}")
         self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -167,6 +171,7 @@ class FakeIPPServer:
         self.listener.settimeout(60.0)
         self.port = self.listener.getsockname()[1]
         self.ipp_status = ipp_status
+        self.raw_response = raw_response
         self.request: HTTPRequest | None = None
         self.queued_jobs: list[HTTPRequest] = []
         self.error: BaseException | None = None
@@ -189,6 +194,9 @@ class FakeIPPServer:
             with connection:
                 connection.settimeout(60.0)
                 self.request = _read_http_request(connection)
+                if self.raw_response is not None:
+                    connection.sendall(self.raw_response)
+                    return
                 request_id = self.request.body[4:8]
                 if len(request_id) != 4:
                     raise NativePrintFailure("IPP request lacks a request-id")
@@ -758,6 +766,87 @@ def exercise_native_print_rejection(qemu: str, template_path: Path) -> int:
     return pages
 
 
+def exercise_malformed_responses(qemu: str, template_path: Path) -> int:
+    malformed_responses = (
+        (
+            "invalid HTTP status line",
+            b"HTTP/1.XY200\r\n\r\n"
+            b"\x01\x01\x00\x00\x00\x00\x00\x01\x03",
+        ),
+        (
+            "truncated IPP attributes",
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: application/ipp\r\n"
+            b"Content-Length: 8\r\n"
+            b"Connection: close\r\n\r\n"
+            b"\x01\x01\x00\x00\x00\x00\x00\x01",
+        ),
+    )
+    template = template_path.read_bytes()
+    refused = 0
+    for case_number, (description, response) in enumerate(
+        malformed_responses, start=1
+    ):
+        image_data = bytearray(template)
+        install_snapshot(
+            image_data,
+            0,
+            build_snapshot(
+                10 + case_number,
+                ((b"MALFORM.TXT", b"MUST NOT REPORT SUCCESS"),),
+            ),
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="nixodria-malformed-print-"
+        ) as directory:
+            runtime_image = Path(directory) / "nixodria.img"
+            runtime_image.write_bytes(image_data)
+            before = runtime_image.read_bytes()
+            with FakeIPPServer(raw_response=response) as printer:
+                with NetworkQemuSession(
+                    qemu, runtime_image, printer.port
+                ) as session:
+                    cursor = session.wait_for(b"nix> ", 0, timeout=15.0)
+                    session.write(b"printer 10.0.2.100\r")
+                    cursor = session.wait_for(
+                        b"printer 10.0.2.100\r\n"
+                        b"Printer configured.\r\n"
+                        b"nix> ",
+                        cursor,
+                    )
+                    transcript_start = len(session.transcript)
+                    session.write(b"print MALFORM.TXT\r")
+                    cursor = session.wait_for(
+                        b"print MALFORM.TXT\r\n"
+                        b"Printer rejected job.\r\n"
+                        b"nix> ",
+                        cursor,
+                        timeout=60.0,
+                    )
+                    command_transcript = bytes(
+                        session.transcript[transcript_start:cursor]
+                    )
+                    if b"Print job queued." in command_transcript:
+                        raise NativePrintFailure(
+                            f"guest accepted {description}"
+                        )
+                    session.write(b"halt\r")
+                    session.wait_for(
+                        b"halt\r\nHalted.\r\n", cursor, timeout=10.0
+                    )
+                printer.result()
+                if printer.queued_jobs:
+                    raise NativePrintFailure(
+                        f"fake printer queued {description}"
+                    )
+            if runtime_image.read_bytes() != before:
+                raise NativePrintFailure(
+                    f"{description} mutated the floppy image"
+                )
+        refused += 1
+    return refused
+
+
 def exercise_corrupt_module(qemu: str, template_path: Path) -> None:
     template = template_path.read_bytes()
     image_data = bytearray(template)
@@ -855,6 +944,9 @@ def main() -> int:
         rejected_pages = exercise_native_print_rejection(
             qemu, Path(sys.argv[1])
         )
+        malformed_responses = exercise_malformed_responses(
+            qemu, Path(sys.argv[1])
+        )
         exercise_corrupt_module(qemu, Path(sys.argv[1]))
         exercise_unavailable_printer(qemu, Path(sys.argv[1]))
     except (NativePrintFailure, OSError, subprocess.SubprocessError) as error:
@@ -864,7 +956,8 @@ def main() -> int:
         f"native print: queued {pages} PWG Raster page(s) with "
         f"{nonwhite} non-white pixels plus one blank page; "
         f"rejected {rejected_pages}-page "
-        f"client-error job; offline printer and corrupt module refused; "
+        f"client-error job; refused {malformed_responses} malformed "
+        f"responses; offline printer and corrupt module refused; "
         f"floppy unchanged"
     )
     return 0

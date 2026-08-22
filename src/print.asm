@@ -1344,16 +1344,24 @@ tcp_wait_response:
     ret
 
 ; AL=0 successful IPP status, AL=2 explicit/malformed rejection, AL=1 need
-; more bytes. The body may be HTTP chunked, so the small scan tolerates a chunk
-; size line between the HTTP header and the IPP response header.
+; more bytes. A successful result requires a valid HTTP/1.0 or HTTP/1.1 status
+; line followed by a structurally complete IPP response entity.
 parse_response:
     mov cx, [response_length]
-    cmp cx, 12
+    cmp cx, 13
     jb .incomplete
     mov si, RESPONSE_BUFFER
     mov di, http_response_prefix
     mov cx, 7
     repe cmpsb
+    jne .malformed
+    mov al, [RESPONSE_BUFFER + 7]
+    cmp al, '0'
+    je .http_version
+    cmp al, '1'
+    jne .malformed
+.http_version:
+    cmp byte [RESPONSE_BUFFER + 8], ' '
     jne .malformed
     cmp byte [RESPONSE_BUFFER + 9], '2'
     jne .rejected
@@ -1361,6 +1369,8 @@ parse_response:
     jne .rejected
     cmp byte [RESPONSE_BUFFER + 11], '0'
     jne .rejected
+    cmp byte [RESPONSE_BUFFER + 12], ' '
+    jne .malformed
 
     mov si, RESPONSE_BUFFER
     mov cx, [response_length]
@@ -1378,37 +1388,72 @@ parse_response:
 .body:
     add si, 4
     sub cx, 4
-    ; Search only the beginning of the response entity for the eight-byte IPP
-    ; header: version, status, and our request-id 1.
-    cmp cx, 40
-    jbe .scan
-    mov cx, 40
-.scan:
     cmp cx, 8
     jb .incomplete
     mov al, [si]
     cmp al, 1
-    je .version
+    je .version_1
     cmp al, 2
-    jne .next_body
-.version:
+    jne .rejected
     cmp byte [si + 1], 2
-    ja .next_body
+    ja .rejected
+    jmp .version_ok
+.version_1:
+    cmp byte [si + 1], 1
+    ja .rejected
+.version_ok:
     cmp dword [si + 4], 0x01000000
-    jne .next_body
+    jne .rejected
     cmp byte [si + 2], 0
     jne .rejected
+    add si, 8
+    sub cx, 8
+
+; Walk the IPP attribute encoding rather than searching arbitrary body bytes.
+; Delimiter tags are one byte. Value tags carry big-endian name/value lengths.
+; End-of-attributes (03h) is mandatory before success can be reported.
+.attributes:
+    cmp cx, 1
+    jb .incomplete
+    lodsb
+    dec cx
+    cmp al, 0x03
+    je .accepted
+    cmp al, 0x10
+    jb .delimiter
+    cmp cx, 4
+    jb .incomplete
+    mov dx, [si]
+    xchg dl, dh
+    add si, 2
+    sub cx, 2
+    cmp dx, cx
+    ja .incomplete
+    add si, dx
+    sub cx, dx
+    cmp cx, 2
+    jb .incomplete
+    mov dx, [si]
+    xchg dl, dh
+    add si, 2
+    sub cx, 2
+    cmp dx, cx
+    ja .incomplete
+    add si, dx
+    sub cx, dx
+    jmp .attributes
+.delimiter:
+    test al, al
+    jz .rejected
+    jmp .attributes
+.accepted:
     xor al, al
     clc
     ret
-.next_body:
-    inc si
-    dec cx
-    jmp .scan
 .malformed:
     ; Once a full status line exists, a non-HTTP response is a protocol error.
     mov cx, [response_length]
-    cmp cx, 12
+    cmp cx, 13
     jae .rejected
 .incomplete:
     mov al, 1
