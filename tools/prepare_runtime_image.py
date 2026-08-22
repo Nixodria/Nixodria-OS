@@ -110,7 +110,7 @@ def prepare_runtime_image(template: Path, runtime: Path) -> str:
             combined_bytes[STORAGE_OFFSET:STORAGE_END] = runtime_data[
                 STORAGE_OFFSET:STORAGE_END
             ]
-            action = "updated system sectors and preserved saved files in"
+            action = "updated OS sectors and preserved saved files in"
         combined = bytes(combined_bytes)
     else:
         combined = template_data

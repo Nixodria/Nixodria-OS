@@ -4,7 +4,9 @@ Nixodria OS is a bootable x86 command-line operating system. Its first
 512-byte BIOS sector loads a ten-sector real-mode kernel from a standard
 1.44 MiB floppy image. A small flat file store holds up to eight named text or
 BASIC files in two alternating recovery snapshots. The kernel starts a serial
-console without processes, networking, or a general-purpose filesystem.
+console without processes or a general-purpose filesystem. A demand-loaded
+native module provides the small network stack and rasterizer used for direct
+IPP printing.
 
 ## Commands
 
@@ -12,6 +14,9 @@ console without processes, networking, or a general-purpose filesystem.
 - `files` — list saved files by name
 - `edit <filename>` — open an existing file or start a new one
 - `edit` — open `UNTITLED.TXT` for compatibility
+- `print <filename>` — rasterize and queue a saved file on the configured printer
+- `printer` — show the configured printer IPv4 address
+- `printer <IPv4>` — set the printer address for the current boot
 - `clear` — clear the terminal
 - `echo <text>` — print text
 - `reboot` — restart the OS through the BIOS
@@ -85,6 +90,30 @@ store does not provide rename or delete operations. This BASIC subset does not
 provide interactive input, string variables, `FOR`/`NEXT`, arrays, functions,
 multiplication, division, parentheses, or multiple statements on one line.
 
+## Native printing
+
+`print NOTES.TXT` reads the saved file, lays it out with the BIOS bitmap font,
+and submits 300 dpi grayscale Letter pages directly to
+`ipp://<printer>:631/ipp/print`. The OS contains its own polled NE2000 driver,
+ARP/IPv4/TCP client, HTTP/IPP encoder, text renderer, and PWG Raster encoder. It
+does not invoke a macOS print dialog, printer driver, CUPS queue, `lp`, or
+host-side renderer. QEMU's virtual Ethernet adapter and user-mode NAT only
+carry the guest's packets to the LAN.
+
+The default address is `192.168.40.220`, the Brother MFC-J6555DW configured for
+this installation. If DHCP changes it, run `printer 192.168.x.x` before
+printing. The setting lasts until reboot. Another printer can be used when it
+offers unauthenticated IPP on port 631 at `/ipp/print` and accepts
+`image/pwg-raster` with 300 dpi `sgray_8` pages.
+
+Only files already saved with Control-S can be printed. Each page holds 93
+columns by 96 lines; long lines wrap, and an empty file produces one blank
+page. `Print job queued.` means the printer returned a successful IPP status;
+it does not claim that the sheet has physically finished. A timeout or lost
+response is reported as a failure and the OS does not open a new connection to
+replay an ambiguous job. The transport is unencrypted local-network IPP, so
+use it only on a trusted LAN.
+
 ## Build and run
 
 NASM, Python 3, GNU Make, and QEMU are required. On macOS with Homebrew:
@@ -114,14 +143,17 @@ make run
 ```
 
 Press Control-C to stop QEMU. The console uses COM1 at 38400 baud, 8 data bits,
-no parity, and one stop bit.
+no parity, and one stop bit. The run target also creates a fixed NE2000 ISA
+adapter at I/O `0x300` with QEMU user-mode networking so the guest can reach a
+printer on the host's LAN.
 
 The reproducible blank image is `build/nixodria.img`. `make run` boots the
 gitignored `.nixodria/nixodria.img` runtime copy. Normal rebuilds refresh only
-its boot and kernel sectors while preserving every saved file; `make clean`
-also leaves this runtime copy intact. When an older single-document runtime
-image is first refreshed, its last valid save immediately appears as
-`UNTITLED.TXT`; the next save converts the disk record to the named-file format.
+its boot, kernel, and native print-module sectors while preserving every saved
+file; `make clean` also leaves this runtime copy intact. When an older
+single-document runtime image is first refreshed, its last valid save
+immediately appears as `UNTITLED.TXT`; the next save converts the disk record to
+the named-file format.
 
 ### Run inside Nixodria for Android
 
@@ -139,6 +171,7 @@ make run
 
 Keep the checkout under `/root` if editor saves should survive Nixodria's
 normal Linux reset. The run target uses TCG software emulation, needs no KVM or
-root access, connects COM1 to Nixodria's terminal, and creates no virtual
-network device. Nixodria also provides a first-class dashboard action that
-performs a pinned, verified version of this setup after confirmation.
+root access, connects COM1 to Nixodria's terminal, and creates an emulated
+NE2000 adapter for native printing. Nixodria also provides a first-class
+dashboard action that performs a pinned, verified version of this setup after
+confirmation.

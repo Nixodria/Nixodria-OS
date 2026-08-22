@@ -10,9 +10,26 @@ IMAGE_SECTORS = 2880
 SYSTEM_SECTORS = 11
 SNAPSHOT_SECTORS = 33
 STORAGE_SECTORS = SNAPSHOT_SECTORS * 2
+PRINT_MODULE_SECTORS = 32
 IMAGE_SIZE = SECTOR_SIZE * IMAGE_SECTORS
 STORAGE_OFFSET = SECTOR_SIZE * SYSTEM_SECTORS
 STORAGE_END = STORAGE_OFFSET + SECTOR_SIZE * STORAGE_SECTORS
+PRINT_OFFSET = STORAGE_END
+PRINT_END = PRINT_OFFSET + SECTOR_SIZE * PRINT_MODULE_SECTORS
+PRINT_SIGNATURE_OFFSET = 3
+PRINT_CHECKSUM_OFFSET = 12
+
+
+def checksum16(data: bytes) -> int:
+    checksum = 0xFFFF
+    for value in data:
+        checksum ^= value << 8
+        for _ in range(8):
+            if checksum & 0x8000:
+                checksum = ((checksum << 1) ^ 0x1021) & 0xFFFF
+            else:
+                checksum = (checksum << 1) & 0xFFFF
+    return checksum
 
 
 def main() -> int:
@@ -36,6 +53,9 @@ def main() -> int:
         b"Files:",
         b"No files.",
         b"Invalid filename.",
+        b"print <filename>",
+        b"Print job queued.",
+        b"Printer unavailable.",
         b"Ctrl-S save",
         b"Ctrl-R run",
         b"Nixodria BASIC",
@@ -55,11 +75,34 @@ def main() -> int:
     if any(storage):
         print("check: newly built file snapshots are not blank", file=sys.stderr)
         return 1
-    if any(data[STORAGE_END:]):
+    module = data[PRINT_OFFSET:PRINT_END]
+    module_strings = (
+        b"POST /ipp/print HTTP/1.1",
+        b"image/pwg-raster",
+        b"PwgRaster",
+        b"RaS2",
+    )
+    if module[PRINT_SIGNATURE_OFFSET : PRINT_SIGNATURE_OFFSET + 9] != b"NIXPRINT1":
+        print("check: native printer module is missing", file=sys.stderr)
+        return 1
+    stored_checksum = int.from_bytes(
+        module[PRINT_CHECKSUM_OFFSET : PRINT_CHECKSUM_OFFSET + 2], "little"
+    )
+    unchecked_module = bytearray(module)
+    unchecked_module[PRINT_CHECKSUM_OFFSET : PRINT_CHECKSUM_OFFSET + 2] = b"\0\0"
+    if stored_checksum != checksum16(unchecked_module):
+        print("check: native printer module checksum is invalid", file=sys.stderr)
+        return 1
+    if any(value not in module for value in module_strings):
+        print("check: native printer protocol strings are missing", file=sys.stderr)
+        return 1
+    if any(data[PRINT_END:]):
         print("check: unused floppy sectors are not blank", file=sys.stderr)
         return 1
 
-    print("check: 1.44 MB BIOS floppy with two blank file snapshots")
+    print(
+        "check: 1.44 MB BIOS floppy with two blank snapshots and native print module"
+    )
     return 0
 
 
