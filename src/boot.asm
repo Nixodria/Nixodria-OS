@@ -29,6 +29,11 @@ FILE_LENGTH     equ 14
 FILE_CHECKSUM   equ 16
 FILES_HEADER_CRC equ FILE_ENTRIES + FILE_COUNT_MAX * FILE_ENTRY_SIZE
 FILES_DATA_SECTORS equ FILE_COUNT_MAX * 4
+PRINT_MODULE_LBA equ STORAGE_LBA_B + STORAGE_SLOT_SECTORS
+PRINT_MODULE_SECTORS equ 32
+PRINT_MODULE_ADDRESS equ 0x1000
+PRINT_MODULE_SIGNATURE equ PRINT_MODULE_ADDRESS + 3
+PRINT_MODULE_CHECKSUM equ PRINT_MODULE_ADDRESS + 12
 
 ; The BIOS loads this first sector at 0000:7c00. Load the small real-mode
 ; kernel from the following sectors, then transfer control to it.
@@ -218,6 +223,21 @@ shell:
     mov di, cmd_files
     call strings_equal
     jc command_files
+
+    mov si, SHELL_BUFFER
+    mov di, cmd_print_file
+    call prefix_equal
+    jc command_print_file
+
+    mov si, SHELL_BUFFER
+    mov di, cmd_printer
+    call strings_equal
+    jc command_printer
+
+    mov si, SHELL_BUFFER
+    mov di, cmd_printer_set
+    call prefix_equal
+    jc command_printer_set
 
     mov si, SHELL_BUFFER
     mov di, cmd_clear
@@ -427,6 +447,191 @@ command_files:
     add di, FILE_ENTRY_SIZE
     loop .next
     jmp shell
+
+; Load the native network/print module only when it is needed, then give it the
+; selected file directly from the verified in-memory snapshot. Its code occupies
+; 1000h-4fffh and scratch space stays below 7000h, clear of the 7c00h stack.
+command_print_file:
+    call filename_normalize
+    jc .valid_name
+    mov si, invalid_filename
+    call print_string
+    jmp shell
+.valid_name:
+    call file_find
+    jc .found
+    mov si, file_not_found
+    call print_string
+    jmp shell
+.found:
+    mov [print_file_index], al
+    mov ax, [di + FILE_LENGTH]
+    mov [print_file_length], ax
+
+    mov bx, PRINT_MODULE_ADDRESS
+    mov cl, PRINT_MODULE_LBA
+    mov si, PRINT_MODULE_SECTORS
+    call storage_read_payload
+    jnc .loaded
+    mov si, print_module_error
+    call print_string
+    jmp shell
+.loaded:
+    cmp dword [PRINT_MODULE_SIGNATURE], 0x5058494e ; "NIXP"
+    jne .bad_module
+    cmp dword [PRINT_MODULE_SIGNATURE + 4], 0x544e4952 ; "RINT"
+    jne .bad_module
+    cmp byte [PRINT_MODULE_SIGNATURE + 8], '1'
+    jne .bad_module
+    mov ax, [PRINT_MODULE_CHECKSUM]
+    mov [print_module_checksum], ax
+    mov word [PRINT_MODULE_CHECKSUM], 0
+    mov si, PRINT_MODULE_ADDRESS
+    mov cx, PRINT_MODULE_SECTORS * 512
+    call storage_checksum
+    mov ax, [print_module_checksum]
+    mov [PRINT_MODULE_CHECKSUM], ax
+    cmp dx, ax
+    jne .bad_module
+
+    xor ah, ah
+    mov al, [print_file_index]
+    shl ax, 11
+    mov si, FILES_DATA
+    add si, ax
+    mov cx, [print_file_length]
+    mov di, current_filename
+    mov bx, printer_ip
+    mov dx, PRINT_MODULE_ADDRESS
+    mov al, 3                  ; a stray RET remains fail-closed
+    stc
+    call dx
+    jc .failed_status
+    test al, al
+    jz .queued
+.failed_status:
+    cmp al, 1
+    je .unavailable
+    cmp al, 2
+    je .rejected
+    mov si, print_failed
+    jmp .report
+.queued:
+    mov si, print_queued
+    jmp .report
+.unavailable:
+    mov si, printer_unavailable
+    jmp .report
+.rejected:
+    mov si, printer_rejected
+.report:
+    call print_string
+    jmp shell
+.bad_module:
+    mov si, print_module_error
+    call print_string
+    jmp shell
+
+command_printer:
+    mov si, printer_heading
+    call print_string
+    mov si, printer_ip
+    call print_ipv4
+    mov si, newline
+    call print_string
+    jmp shell
+
+command_printer_set:
+    call parse_ipv4
+    jc .configured
+    mov si, invalid_address
+    call print_string
+    jmp shell
+.configured:
+    mov ax, [printer_candidate]
+    mov [printer_ip], ax
+    mov ax, [printer_candidate + 2]
+    mov [printer_ip + 2], ax
+    mov si, printer_configured
+    call print_string
+    jmp shell
+
+; Carry is set only for exactly four decimal octets in the range 0-255.
+; Parsing into a temporary keeps the active target unchanged on bad input.
+parse_ipv4:
+    push ax
+    push bx
+    push cx
+    push dx
+    push di
+    mov di, printer_candidate
+    mov cx, 4
+.octet:
+    xor bx, bx
+    xor dx, dx
+.digit:
+    mov al, [si]
+    cmp al, '0'
+    jb .octet_end
+    cmp al, '9'
+    ja .octet_end
+    cmp dh, 3
+    jae .invalid
+    mov ax, bx
+    shl bx, 1
+    shl ax, 3
+    add bx, ax
+    xor ah, ah
+    mov al, [si]
+    sub al, '0'
+    add bx, ax
+    cmp bx, 255
+    ja .invalid
+    inc si
+    inc dh
+    jmp .digit
+.octet_end:
+    test dh, dh
+    jz .invalid
+    mov [di], bl
+    inc di
+    dec cx
+    jz .last
+    cmp byte [si], '.'
+    jne .invalid
+    inc si
+    jmp .octet
+.last:
+    cmp byte [si], 0
+    jne .invalid
+    stc
+    jmp .restore
+.invalid:
+    clc
+.restore:
+    pop di
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+print_ipv4:
+    mov cx, 4
+.octet:
+    push cx
+    xor ax, ax
+    mov al, [si]
+    inc si
+    call basic_print_unsigned
+    pop cx
+    dec cx
+    jz .done
+    mov al, '.'
+    call serial_write
+    jmp .octet
+.done:
+    ret
 
 ; Normalize a short filename from DS:SI into current_filename. Names are
 ; case-insensitive and contain 1-12 letters, digits, dots, underscores, or
@@ -1677,7 +1882,8 @@ prompt         db 'nix> ', 0
 newline        db 13, 10, 0
 erase          db 8, ' ', 8, 0
 unknown        db 'Unknown command.', 13, 10, 0
-help_text      db 'help files edit [filename] clear echo <text> reboot halt', 13, 10, 0
+help_text      db 'help files edit [filename] print <filename> printer [IPv4]', 13, 10
+               db 'clear echo <text> reboot halt', 13, 10, 0
 editor_header  db 'Nixodria Editor: ', 0
 editor_controls db 13, 10, 'Ctrl-S save | Ctrl-R run | Ctrl-X exit | Ctrl-L clear', 13, 10, 0
 clear_sequence db 27, '[2J', 27, '[H', 0
@@ -1687,12 +1893,24 @@ storage_full   db 'Storage full.', 13, 10, 0
 invalid_filename db 'Invalid filename.', 13, 10, 0
 files_heading  db 'Files:', 13, 10, 0
 no_files       db 'No files.', 13, 10, 0
+file_not_found db 'File not found.', 13, 10, 0
+printer_heading db 'Printer: ', 0
+printer_configured db 'Printer configured.', 13, 10, 0
+invalid_address db 'Invalid IPv4 address.', 13, 10, 0
+print_queued   db 'Print job queued.', 13, 10, 0
+printer_unavailable db 'Printer unavailable.', 13, 10, 0
+printer_rejected db 'Printer rejected job.', 13, 10, 0
+print_failed   db 'Print failed.', 13, 10, 0
+print_module_error db 'Printer module unavailable.', 13, 10, 0
 rebooting      db 'Rebooting...', 13, 10, 0
 halted         db 'Halted.', 13, 10, 0
 cmd_help       db 'help', 0
 cmd_edit       db 'edit', 0
 cmd_edit_file  db 'edit ', 0
 cmd_files      db 'files', 0
+cmd_print_file db 'print ', 0
+cmd_printer    db 'printer', 0
+cmd_printer_set db 'printer ', 0
 cmd_clear      db 'clear', 0
 cmd_reboot     db 'reboot', 0
 cmd_halt       db 'halt', 0
@@ -1733,9 +1951,15 @@ basic_line     dw 0
 basic_steps    dw 0
 basic_left     dw 0
 basic_operator db 0
+printer_ip     db 192, 168, 40, 220
+printer_candidate times 4 db 0
+print_file_index db 0
+print_file_length dw 0
+print_module_checksum dw 0
 
 ; Keep executable code inside the sectors loaded by the first-stage loader.
 times (1 + KERNEL_SECTORS) * 512 - ($ - $$) db 0
 
-; Pad to a standard 1.44 MiB floppy. Both save snapshots start blank.
+; Pad the base image. The build overlays the native printer module after both
+; blank recovery snapshots without changing their established LBAs.
 times IMAGE_SECTORS * 512 - ($ - $$) db 0

@@ -404,7 +404,7 @@ def assert_saved_snapshot(
     if data[:STORAGE_OFFSET] != template[:STORAGE_OFFSET]:
         raise SmokeFailure("saving files changed boot or kernel sectors")
     if data[STORAGE_END:] != template[STORAGE_END:]:
-        raise SmokeFailure("saving files changed unused floppy sectors")
+        raise SmokeFailure("saving files changed the printer module or unused sectors")
 
     normalized = tuple(
         (normalize_filename(filename), document) for filename, document in expected
@@ -613,11 +613,44 @@ def exercise_filename_rules(qemu: str, image: Path) -> None:
         session.write(b"help\r\n")
         cursor = session.wait_for(
             b"help\r\n"
-            b"help files edit [filename] clear echo <text> reboot halt\r\n"
+            b"help files edit [filename] print <filename> printer [IPv4]\r\n"
+            b"clear echo <text> reboot halt\r\n"
             b"nix> ",
             cursor,
         )
         cursor = assert_files(session, (), cursor)
+
+        session.write(b"printer\r")
+        cursor = session.wait_for(
+            b"printer\r\nPrinter: 192.168.40.220\r\nnix> ", cursor
+        )
+        for invalid_address in (
+            b"1.2.3",
+            b"1.2.3.4.5",
+            b"256.2.3.4",
+            b"1.2.x.4",
+        ):
+            command = b"printer " + invalid_address
+            session.write(command + b"\r")
+            cursor = session.wait_for(
+                command + b"\r\nInvalid IPv4 address.\r\nnix> ", cursor
+            )
+        session.write(b"printer 10.0.2.100\r")
+        cursor = session.wait_for(
+            b"printer 10.0.2.100\r\nPrinter configured.\r\nnix> ", cursor
+        )
+        session.write(b"printer\r")
+        cursor = session.wait_for(
+            b"printer\r\nPrinter: 10.0.2.100\r\nnix> ", cursor
+        )
+        session.write(b"print missing.txt\r")
+        cursor = session.wait_for(
+            b"print missing.txt\r\nFile not found.\r\nnix> ", cursor
+        )
+        session.write(b"print bad/name\r")
+        cursor = session.wait_for(
+            b"print bad/name\r\nInvalid filename.\r\nnix> ", cursor
+        )
 
         for invalid in (b"bad/name", b"has space", b"x" * 13):
             command = b"edit " + invalid
