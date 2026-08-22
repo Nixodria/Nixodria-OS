@@ -2,6 +2,7 @@
 """Boot Nixodria OS in QEMU and exercise named files and durable snapshots."""
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
 import selectors
 import shutil
@@ -24,6 +25,8 @@ STORAGE_OFFSET = SYSTEM_SECTORS * SECTOR_SIZE
 SNAPSHOT_OFFSETS = (STORAGE_OFFSET, STORAGE_OFFSET + SNAPSHOT_SIZE)
 SNAPSHOT_LBAS = (SYSTEM_SECTORS, SYSTEM_SECTORS + SNAPSHOT_SECTORS)
 STORAGE_END = STORAGE_OFFSET + 2 * SNAPSHOT_SIZE
+PRINT_MODULE_SECTORS = 32
+BASIC_MODULE_OFFSET = STORAGE_END + PRINT_MODULE_SECTORS * SECTOR_SIZE
 IMAGE_SIZE = IMAGE_SECTORS * SECTOR_SIZE
 STORAGE_MAGIC = b"NIX3"
 LEGACY_STORAGE_MAGIC = b"NIX2"
@@ -44,6 +47,20 @@ EDITOR_CONTROLS = (
 )
 BASIC_FRAME = CLEAR_SCREEN + b"Nixodria BASIC\r\n\r\n"
 BASIC_FINISHED = b"\r\nProgram finished. Press any key."
+TETRIS_TITLE = b"TETRIS"
+TETRIS_GAME_OVER = b"GAME OVER"
+TETRIS_CONTROLS = b"a d w s space q"
+TETRIS_SOURCE = Path(__file__).resolve().parents[1] / "apps" / "TETRIS.BAS"
+TETRIS_FULL_ROW = (1 << 10) - 1
+
+
+@dataclass(frozen=True)
+class TetrisScreen:
+    cursor: int
+    rows: tuple[int, ...]
+    score: int
+    lines: int
+    game_over: bool = False
 
 
 def normalize_filename(filename: bytes) -> bytes:
@@ -189,6 +206,219 @@ class QemuSession:
             except subprocess.TimeoutExpired:
                 self.process.kill()
                 self.process.wait(timeout=2)
+
+
+def parse_tetris_stat(line: bytes, prefix: bytes) -> int:
+    if not line.startswith(prefix):
+        raise SmokeFailure(
+            f"Tetris status line {line!r} does not start with {prefix!r}"
+        )
+    value = line[len(prefix) :]
+    if not value or any(byte < ord("0") or byte > ord("9") for byte in value):
+        raise SmokeFailure(f"Tetris status line is not decimal: {line!r}")
+    return int(value)
+
+
+def wait_for_tetris_screen(
+    session: QemuSession, start: int, timeout: float = 5.0
+) -> TetrisScreen:
+    clear_end = session.wait_for(CLEAR_SCREEN, start, timeout=timeout)
+    screen_start = clear_end - len(CLEAR_SCREEN)
+    title_end = session.wait_for(b"\r\n", clear_end, timeout=timeout)
+    title = bytes(session.transcript[clear_end : title_end - 2])
+
+    if title == TETRIS_TITLE:
+        screen_end = session.wait_for(
+            TETRIS_CONTROLS + b"\r\n", title_end, timeout=timeout
+        )
+        screen = bytes(session.transcript[screen_start:screen_end])
+        physical_lines = screen[len(CLEAR_SCREEN) :].split(b"\r\n")
+        if len(physical_lines) != 25 or physical_lines[-1] != b"":
+            raise SmokeFailure(
+                f"Tetris frame has {len(physical_lines) - 1} physical lines; "
+                "expected 24"
+            )
+        if physical_lines[0] != TETRIS_TITLE:
+            raise SmokeFailure("Tetris frame title changed while parsing")
+        rows: list[int] = []
+        for row_number, rendered in enumerate(physical_lines[1:21]):
+            if (
+                len(rendered) != 12
+                or rendered[:1] != b"|"
+                or rendered[-1:] != b"|"
+                or any(value not in b"01" for value in rendered[1:-1])
+            ):
+                raise SmokeFailure(
+                    f"Tetris row {row_number} is not a 10-cell binary row: "
+                    f"{rendered!r}"
+                )
+            # The BASIC source prints each row least-significant bit first.
+            rows.append(int(rendered[1:-1][::-1], 2))
+        score = parse_tetris_stat(physical_lines[21], b"S ")
+        lines = parse_tetris_stat(physical_lines[22], b"L ")
+        if physical_lines[23] != TETRIS_CONTROLS:
+            raise SmokeFailure("Tetris controls line is missing")
+        return TetrisScreen(screen_end, tuple(rows), score, lines)
+
+    if title == TETRIS_GAME_OVER:
+        screen_end = session.wait_for(b"r/q\r\n", title_end, timeout=timeout)
+        screen = bytes(session.transcript[screen_start:screen_end])
+        physical_lines = screen[len(CLEAR_SCREEN) :].split(b"\r\n")
+        if (
+            len(physical_lines) != 5
+            or physical_lines[0] != TETRIS_GAME_OVER
+            or physical_lines[3] != b"r/q"
+            or physical_lines[4] != b""
+        ):
+            raise SmokeFailure(f"malformed Tetris game-over frame: {screen!r}")
+        score = parse_tetris_stat(physical_lines[1], b"S ")
+        lines = parse_tetris_stat(physical_lines[2], b"L ")
+        return TetrisScreen(screen_end, (), score, lines, game_over=True)
+
+    raise SmokeFailure(f"unexpected full-screen BASIC output title: {title!r}")
+
+
+def tetris_occupied_cells(screen: TetrisScreen) -> int:
+    return sum(row.bit_count() for row in screen.rows)
+
+
+def rotate_tetris_piece(piece: int) -> int:
+    if piece in (15, 4369):
+        return 4384 - piece
+    if piece == 51:
+        return piece
+    rotated = 0
+    for bit in range(12):
+        if piece & (1 << bit):
+            column = bit % 4
+            row = bit // 4
+            rotated |= 1 << (column * 4 + 2 - row)
+    return rotated
+
+
+def tetris_piece_valid(
+    rows: tuple[int, ...], piece: int, x: int, y: int
+) -> bool:
+    if x < 0:
+        return False
+    for piece_row in range(4):
+        cells = (piece >> (piece_row * 4)) & 0xF
+        if cells == 0:
+            continue
+        board_row = y + piece_row
+        shifted = cells << x
+        if (
+            board_row < 0
+            or board_row >= 20
+            or shifted > TETRIS_FULL_ROW
+            or rows[board_row] & shifted
+        ):
+            return False
+    return True
+
+
+def lock_tetris_piece(
+    rows: tuple[int, ...], piece: int, x: int
+) -> tuple[tuple[int, ...], int]:
+    if not tetris_piece_valid(rows, piece, x, 0):
+        raise SmokeFailure("Tetris bot selected a placement blocked at spawn")
+    y = 0
+    while tetris_piece_valid(rows, piece, x, y + 1):
+        y += 1
+    locked = list(rows)
+    for piece_row in range(4):
+        cells = (piece >> (piece_row * 4)) & 0xF
+        if cells:
+            locked[y + piece_row] |= cells << x
+    remaining = [row for row in locked if row != TETRIS_FULL_ROW]
+    cleared = len(locked) - len(remaining)
+    return tuple([0] * cleared + remaining), cleared
+
+
+def infer_spawned_tetris_piece(
+    combined: tuple[int, ...], locked: tuple[int, ...]
+) -> int:
+    if len(combined) != 20 or len(locked) != 20:
+        raise SmokeFailure("Tetris board does not have 20 rows")
+    active_rows: list[int] = []
+    for combined_row, locked_row in zip(combined, locked):
+        if (combined_row & locked_row) != locked_row:
+            raise SmokeFailure("Tetris frame lost a previously locked cell")
+        active_rows.append(combined_row ^ locked_row)
+    if sum(row.bit_count() for row in active_rows) != 4:
+        raise SmokeFailure("Tetris frame does not contain one four-cell active piece")
+    if any(active_rows[4:]):
+        raise SmokeFailure("Tetris active piece did not spawn in its four-row mask")
+    piece = 0
+    for row_number, active_row in enumerate(active_rows[:4]):
+        if active_row & 0x7 or active_row >> 7:
+            raise SmokeFailure("Tetris active piece did not spawn at x=3")
+        piece |= (active_row >> 3) << (row_number * 4)
+    if piece.bit_count() != 4:
+        raise SmokeFailure("Tetris spawn mask is not a tetromino")
+    return piece
+
+
+def tetris_board_cost(rows: tuple[int, ...], cleared: int) -> int:
+    heights: list[int] = []
+    holes = 0
+    for column in range(10):
+        occupied = [row for row in range(20) if rows[row] & (1 << column)]
+        if not occupied:
+            heights.append(0)
+            continue
+        top = occupied[0]
+        heights.append(20 - top)
+        holes += sum(
+            1 for row in range(top + 1, 20) if not rows[row] & (1 << column)
+        )
+    bumpiness = sum(
+        abs(left - right) for left, right in zip(heights, heights[1:])
+    )
+    return (
+        holes * 100
+        + sum(heights) * 4
+        + bumpiness * 2
+        + max(heights) * 3
+        - cleared * 100
+    )
+
+
+def choose_tetris_placement(
+    rows: tuple[int, ...], piece: int
+) -> tuple[int, int, tuple[int, ...], int]:
+    choices: list[tuple[int, int, int, int, tuple[int, ...], int]] = []
+    rotated = piece
+    seen: set[int] = set()
+    for rotations in range(4):
+        if rotated not in seen:
+            seen.add(rotated)
+            for x in range(10):
+                if not tetris_piece_valid(rows, rotated, x, 0):
+                    continue
+                result, cleared = lock_tetris_piece(rows, rotated, x)
+                choices.append(
+                    (
+                        tetris_board_cost(result, cleared),
+                        abs(x - 3) + rotations,
+                        rotations,
+                        x,
+                        result,
+                        cleared,
+                    )
+                )
+        rotated = rotate_tetris_piece(rotated)
+    if not choices:
+        raise SmokeFailure("Tetris bot found no legal placement")
+    _, _, rotations, x, result, cleared = min(choices)
+    return rotations, x, result, cleared
+
+
+def send_tetris_key(
+    session: QemuSession, screen: TetrisScreen, key: bytes
+) -> TetrisScreen:
+    session.write(key)
+    return wait_for_tetris_screen(session, screen.cursor, timeout=10.0)
 
 
 def halt(session: QemuSession, cursor: int) -> None:
@@ -607,14 +837,257 @@ def exercise_basic(qemu: str, image: Path, template: bytes) -> None:
     )
 
 
+def exercise_extended_basic(qemu: str, image: Path) -> None:
+    filename = b"EXTENDED.BAS"
+    program = (
+        b'10 cls:print "EXTENDED"\r\n'
+        b"20 dim a(3):a(1)=6:let a(2)=5\r\n"
+        b"30 x=(a(1)+a(2))*6/2:y=x mod 10:z=x and 7\r\n"
+        b'40 print "MATH ";:print x;:print ",";:print y;:print ",";:print z\r\n'
+        b'50 c=1:gosub 200:c=c+10:print "RETURN ";:print c\r\n'
+        b'60 timer t:wait 1:timer u:print "YIELD"\r\n'
+        b"70 wait 1:key k:if k=0 then 70\r\n"
+        b'80 print "KEY ";:print k\r\n'
+        b"90 end\r\n"
+        b"200 c=c+2:return"
+    )
+    original = image.read_bytes()
+
+    with QemuSession(qemu, image) as session:
+        cursor = session.wait_for(b"nix> ", 0)
+        command = b"edit " + filename
+        session.write(command + b"\r")
+        cursor = session.wait_for(
+            command + b"\r\n" + editor_frame(filename), cursor
+        )
+        session.write(program + b"\x12")
+        cursor = session.wait_for(
+            program
+            + BASIC_FRAME
+            + CLEAR_SCREEN
+            + b"EXTENDED\r\n"
+            + b"MATH 33,3,1\r\n"
+            + b"RETURN 13\r\n"
+            + b"YIELD\r\n",
+            cursor,
+            timeout=10.0,
+        )
+        session.write(b"Z")
+        cursor = session.wait_for(b"KEY 90\r\n" + BASIC_FINISHED, cursor)
+        session.write(b" ")
+        cursor = session.wait_for(editor_frame(filename) + program, cursor)
+        session.write(b"\x18")
+        cursor = session.wait_for(b"\r\nnix> ", cursor)
+        cursor = assert_files(session, (), cursor)
+        halt(session, cursor)
+
+    if image.read_bytes() != original:
+        raise SmokeFailure("extended unsaved BASIC checks changed the disk image")
+
+
+def exercise_corrupt_basic_module(qemu: str, image: Path) -> None:
+    original = image.read_bytes()
+    damaged = bytearray(original)
+    damaged[BASIC_MODULE_OFFSET + 128] ^= 0x5A
+    image.write_bytes(damaged)
+    damaged_before = image.read_bytes()
+
+    with QemuSession(qemu, image) as session:
+        cursor = session.wait_for(b"nix> ", 0)
+        session.write(b"run TETRIS.BAS\r")
+        cursor = session.wait_for(
+            b"run TETRIS.BAS\r\n"
+            + CLEAR_SCREEN
+            + b"BASIC runtime unavailable. Press any key.",
+            cursor,
+        )
+        session.write(b" ")
+        cursor = session.wait_for(b"nix> ", cursor)
+        session.write(b"echo OK\r")
+        cursor = session.wait_for(b"echo OK\r\nOK\r\nnix> ", cursor)
+        halt(session, cursor)
+
+    if image.read_bytes() != damaged_before:
+        raise SmokeFailure("corrupt BASIC-module refusal changed the disk image")
+
+
+def exercise_bundled_tetris(qemu: str, image: Path) -> None:
+    source = TETRIS_SOURCE.read_bytes()
+    if b"\r" in source or b"\0" in source or any(value > 0x7F for value in source):
+        raise SmokeFailure("tracked TETRIS.BAS is not normalizable ASCII source")
+    source = source.replace(b"\n", b"\r\n")
+    if len(source) > DOCUMENT_MAX:
+        raise SmokeFailure("normalized TETRIS.BAS exceeds the editor capacity")
+    original = image.read_bytes()
+
+    with QemuSession(qemu, image) as session:
+        cursor = session.wait_for(b"nix> ", 0)
+        cursor = assert_files(session, (), cursor)
+        cursor = assert_editor_document(session, b"TETRIS.BAS", source, cursor)
+        cursor = assert_files(session, (), cursor)
+
+        session.write(b"run MISSING.BAS\r")
+        cursor = session.wait_for(
+            b"run MISSING.BAS\r\nFile not found.\r\nnix> ", cursor
+        )
+
+        session.write(b"run TETRIS.BAS\r")
+        cursor = session.wait_for(b"run TETRIS.BAS\r\n" + BASIC_FRAME, cursor)
+        screen = wait_for_tetris_screen(session, cursor, timeout=10.0)
+        if screen.game_over or tetris_occupied_cells(screen) != 4:
+            raise SmokeFailure("Tetris initial frame does not have one active piece")
+        if screen.score != 0 or screen.lines != 0:
+            raise SmokeFailure("Tetris initial score or line count is not zero")
+        initial_piece = infer_spawned_tetris_piece(screen.rows, (0,) * 20)
+
+        left = send_tetris_key(session, screen, b"a")
+        if left.game_over or left.rows == screen.rows or tetris_occupied_cells(left) != 4:
+            raise SmokeFailure("Tetris left movement did not redraw the active piece")
+        right = send_tetris_key(session, left, b"d")
+        if right.game_over or right.rows == left.rows or tetris_occupied_cells(right) != 4:
+            raise SmokeFailure("Tetris right movement did not redraw the active piece")
+        rotated = send_tetris_key(session, right, b"w")
+        if rotated.game_over or tetris_occupied_cells(rotated) != 4:
+            raise SmokeFailure("Tetris rotation did not return a valid frame")
+        lowered = send_tetris_key(session, rotated, b"s")
+        if (
+            lowered.game_over
+            or lowered.rows == rotated.rows
+            or tetris_occupied_cells(lowered) != 4
+        ):
+            raise SmokeFailure("Tetris soft drop did not redraw a lower active piece")
+
+        first_orientation = rotate_tetris_piece(initial_piece)
+        locked, first_cleared = lock_tetris_piece(
+            (0,) * 20, first_orientation, 3
+        )
+        if first_cleared:
+            raise SmokeFailure("the first Tetris piece unexpectedly cleared a line")
+        screen = send_tetris_key(session, lowered, b" ")
+        if screen.game_over or tetris_occupied_cells(screen) != 8:
+            raise SmokeFailure(
+                "the first Tetris hard drop did not leave four locked and four active cells"
+            )
+        infer_spawned_tetris_piece(screen.rows, locked)
+
+        cleared_a_line = False
+        for _ in range(40):
+            piece = infer_spawned_tetris_piece(screen.rows, locked)
+            rotations, x, expected_locked, cleared = choose_tetris_placement(
+                locked, piece
+            )
+            for _ in range(rotations):
+                screen = send_tetris_key(session, screen, b"w")
+                if screen.game_over:
+                    raise SmokeFailure("Tetris ended while rotating a legal placement")
+            move = b"a" if x < 3 else b"d"
+            for _ in range(abs(x - 3)):
+                screen = send_tetris_key(session, screen, move)
+                if screen.game_over:
+                    raise SmokeFailure("Tetris ended while moving a legal placement")
+            previous_score = screen.score
+            previous_lines = screen.lines
+            screen = send_tetris_key(session, screen, b" ")
+            if screen.game_over:
+                raise SmokeFailure("Tetris ended before the line-clear assertion")
+            if screen.lines != previous_lines + cleared:
+                raise SmokeFailure(
+                    "Tetris line counter did not match simulated compaction"
+                )
+            if screen.score != previous_score + cleared * 100:
+                raise SmokeFailure("Tetris score did not match cleared lines")
+            locked = expected_locked
+            infer_spawned_tetris_piece(screen.rows, locked)
+            if cleared:
+                cleared_a_line = True
+                break
+        if not cleared_a_line:
+            raise SmokeFailure("Tetris bot did not produce a line clear")
+
+        for _ in range(64):
+            screen = send_tetris_key(session, screen, b" ")
+            if screen.game_over:
+                break
+        else:
+            raise SmokeFailure("repeated Tetris hard drops did not reach game over")
+
+        session.write(b"r")
+        screen = wait_for_tetris_screen(session, screen.cursor, timeout=10.0)
+        if (
+            screen.game_over
+            or tetris_occupied_cells(screen) != 4
+            or screen.score != 0
+            or screen.lines != 0
+        ):
+            raise SmokeFailure("Tetris restart did not reset to one active piece")
+
+        session.write(b"q")
+        cursor = session.wait_for(BASIC_FINISHED, screen.cursor, timeout=10.0)
+        session.write(b" ")
+        cursor = session.wait_for(b"nix> ", cursor)
+        session.write(b"echo OK\r")
+        cursor = session.wait_for(b"echo OK\r\nOK\r\nnix> ", cursor)
+        cursor = assert_files(session, (), cursor)
+        halt(session, cursor)
+
+    if image.read_bytes() != original:
+        raise SmokeFailure("bundled Tetris gameplay changed the disk image")
+
+
+def exercise_saved_tetris_override(
+    qemu: str, image: Path, template: bytes
+) -> None:
+    filename = b"TETRIS.BAS"
+    bundled = TETRIS_SOURCE.read_bytes().replace(b"\n", b"\r\n")
+    override = b'10 print "OVERRIDE"\r\n20 end'
+
+    with QemuSession(qemu, image) as session:
+        cursor = session.wait_for(b"nix> ", 0)
+        command = b"edit " + filename
+        session.write(command + b"\r")
+        cursor = session.wait_for(
+            command + b"\r\n" + editor_frame(filename) + bundled, cursor
+        )
+        session.write(b"\x0c")
+        cursor = session.wait_for(editor_frame(filename), cursor)
+        session.write(override + b"\x13")
+        cursor = session.wait_for(
+            override + editor_frame(filename, b"Saved.") + override, cursor
+        )
+        session.write(b"\x18")
+        cursor = session.wait_for(b"\r\nnix> ", cursor)
+
+        session.write(b"run TETRIS.BAS\r")
+        cursor = session.wait_for(
+            b"run TETRIS.BAS\r\n"
+            + BASIC_FRAME
+            + b"OVERRIDE\r\n"
+            + BASIC_FINISHED,
+            cursor,
+        )
+        session.write(b" ")
+        cursor = session.wait_for(b"nix> ", cursor)
+        cursor = assert_editor_document(session, filename, override, cursor)
+        halt(session, cursor)
+
+    assert_saved_snapshot(
+        image,
+        ((filename, override),),
+        template,
+        expected_slot=0,
+        expected_generation=0,
+    )
+
+
 def exercise_filename_rules(qemu: str, image: Path) -> None:
     with QemuSession(qemu, image) as session:
         cursor = session.wait_for(b"nix> ", 0)
         session.write(b"help\r\n")
         cursor = session.wait_for(
             b"help\r\n"
-            b"help files edit [filename] print <filename> printer [IPv4]\r\n"
-            b"clear echo <text> reboot halt\r\n"
+            b"help files edit [filename] run <filename>\r\n"
+            b"print <filename> printer [IPv4] clear echo <text> reboot halt\r\n"
+            b"Try: run TETRIS.BAS\r\n"
             b"nix> ",
             cursor,
         )
@@ -1262,6 +1735,24 @@ def main() -> int:
             shutil.copyfile(source_image, basic_image)
             exercise_basic(qemu, basic_image, source_before)
 
+            extended_basic_image = root / "extended-basic.img"
+            shutil.copyfile(source_image, extended_basic_image)
+            exercise_extended_basic(qemu, extended_basic_image)
+
+            tetris_image = root / "tetris.img"
+            shutil.copyfile(source_image, tetris_image)
+            exercise_bundled_tetris(qemu, tetris_image)
+
+            tetris_override_image = root / "tetris-override.img"
+            shutil.copyfile(source_image, tetris_override_image)
+            exercise_saved_tetris_override(
+                qemu, tetris_override_image, source_before
+            )
+
+            corrupt_basic_image = root / "corrupt-basic.img"
+            shutil.copyfile(source_image, corrupt_basic_image)
+            exercise_corrupt_basic_module(qemu, corrupt_basic_image)
+
             filename_image = root / "filenames.img"
             shutil.copyfile(source_image, filename_image)
             exercise_filename_rules(qemu, filename_image)
@@ -1354,7 +1845,8 @@ def main() -> int:
         return 1
 
     print(
-        "smoke: named files, BASIC, persistence, recovery, and write faults passed"
+        "smoke: named files, extended BASIC, Tetris, persistence, recovery, "
+        "and write faults passed"
     )
     return 0
 

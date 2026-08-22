@@ -14,6 +14,9 @@ IMAGE_SECTORS = 2880
 SYSTEM_SECTORS = 11
 SNAPSHOT_SECTORS = 33
 STORAGE_SECTORS = SNAPSHOT_SECTORS * 2
+PRINT_MODULE_SECTORS = 32
+BASIC_MODULE_SECTORS = 16
+APP_SLOT_SECTORS = 5
 LEGACY_SYSTEM_SECTORS = (8, 4)
 LEGACY_STORAGE_SECTORS = 10
 LEGACY_SLOT_SECTORS = 5
@@ -23,6 +26,10 @@ SNAPSHOT_SIZE = SECTOR_SIZE * SNAPSHOT_SECTORS
 STORAGE_SIZE = SECTOR_SIZE * STORAGE_SECTORS
 STORAGE_OFFSET = SYSTEM_SIZE
 STORAGE_END = STORAGE_OFFSET + STORAGE_SIZE
+PRINT_OFFSET = STORAGE_END
+BASIC_OFFSET = PRINT_OFFSET + SECTOR_SIZE * PRINT_MODULE_SECTORS
+APP_OFFSET = BASIC_OFFSET + SECTOR_SIZE * BASIC_MODULE_SECTORS
+APP_END = APP_OFFSET + SECTOR_SIZE * APP_SLOT_SECTORS
 LEGACY_STORAGE_SIZE = SECTOR_SIZE * LEGACY_STORAGE_SECTORS
 LEGACY_SLOT_SIZE = SECTOR_SIZE * LEGACY_SLOT_SECTORS
 
@@ -94,8 +101,15 @@ def main() -> int:
             os.chmod(runtime, 0o600)
 
             refreshed_template = bytearray(template_data)
-            refreshed_template[SYSTEM_SIZE - 1] ^= 0x5A
-            refreshed_template[STORAGE_END + 17] ^= 0x3C
+            immutable_probes = (
+                (SYSTEM_SIZE - 1, 0x5A),
+                (PRINT_OFFSET + 17, 0x3C),
+                (BASIC_OFFSET + 17, 0x69),
+                (APP_OFFSET + 17, 0x96),
+                (APP_END + 17, 0xA5),
+            )
+            for offset, mask in immutable_probes:
+                refreshed_template[offset] ^= mask
             template.write_bytes(refreshed_template)
             run_preparer(preparer, template, runtime)
 

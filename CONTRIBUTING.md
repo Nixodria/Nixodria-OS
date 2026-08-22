@@ -92,10 +92,14 @@ include the relevant version output in your issue or pull request.
 ## Repository layout
 
 - `src/boot.asm` contains the boot sector, resident real-mode kernel, shell,
-  editor, durable storage implementation, and BASIC interpreter.
+  editor, durable storage implementation, and checked module loaders.
+- `src/basic.asm` contains the demand-loaded Nixodria BASIC interpreter and its
+  general-purpose interactive runtime support.
 - `src/print.asm` contains the demand-loaded NE2000, TCP/IP, IPP, and raster
   printing module.
-- `tools/build_image.py` installs the printer module after both file snapshots.
+- `apps/TETRIS.BAS` contains the complete editable Tetris application source.
+- `tools/build_image.py` installs both modules and the bundled BASIC source
+  after the file snapshots.
 - `tools/prepare_runtime_image.py` creates or safely refreshes the writable
   runtime image while preserving its file snapshots.
 - `tests/check_image.py` validates the assembled image's static invariants.
@@ -117,16 +121,20 @@ must not be committed.
 ### Preserve image and boot invariants
 
 The current image is a standard 1.44 MiB floppy: one 512-byte BIOS boot sector,
-a ten-sector resident kernel, two 33-sector file snapshots, and a 32-sector
-native printer-module slot. Each snapshot contains one directory sector and
+a ten-sector resident kernel, two 33-sector file snapshots, a 32-sector native
+printer-module slot, a 16-sector BASIC-module slot, and a five-sector bundled
+application slot. The application slot contains one checked header sector and
+four source sectors. Each writable snapshot contains one directory sector and
 eight fixed four-sector file slots. The first sector must retain its `55 aa`
 BIOS signature, a freshly built image must have blank snapshots, and sectors
-after the printer-module slot must remain blank.
+after the bundled-application slot must remain blank.
 
 If a change intentionally alters the image layout, update every affected
 constant and assumption together in:
 
 - `src/boot.asm`
+- `Makefile`
+- `tools/build_image.py`
 - `tools/prepare_runtime_image.py`
 - `tests/check_image.py`
 - `tests/check_runtime_image.py`
@@ -142,8 +150,9 @@ make a larger image build.
 
 ### Protect persistent data
 
-Normal rebuilds replace the runtime image's immutable boot, kernel, printer
-module, and unused sectors. They must not overwrite either file snapshot.
+Normal rebuilds replace the runtime image's immutable boot, kernel, printer and
+BASIC modules, bundled application source, and unused sectors. They must not
+overwrite either file snapshot.
 `make clean` intentionally removes
 `build/` but leaves `.nixodria/nixodria.img` intact.
 
@@ -174,8 +183,9 @@ The repository provides these validation targets:
 - `make` assembles `build/nixodria.img` with NASM warnings treated as errors.
 - `make check` validates the image layout and runtime-image preparation logic.
 - `make smoke` runs `make check`, then exercises the shell, editor, BASIC
-  interpreter, persistence, recovery, write-failure behavior, and a complete
-  native print submission to a local fake IPP printer in QEMU.
+  interpreter and interactive runtime, bundled Tetris game, persistence,
+  recovery, write-failure behavior, and a complete native print submission to
+  a local fake IPP printer in QEMU.
 - `make run` starts an interactive session on the headless COM1 serial console.
   Press Control-C to stop QEMU.
 

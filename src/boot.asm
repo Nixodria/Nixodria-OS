@@ -4,7 +4,6 @@ org 0x7c00
 COM1            equ 0x3f8
 SHELL_BUFFER    equ 0x0600
 SHELL_CAPACITY  equ 32
-BASIC_VARS      equ 0x0800
 STORAGE_HEADER_A equ 0x9400
 STORAGE_HEADER_B equ 0x9600
 FILES_HEADER    equ 0x9800
@@ -34,6 +33,17 @@ PRINT_MODULE_SECTORS equ 32
 PRINT_MODULE_ADDRESS equ 0x1000
 PRINT_MODULE_SIGNATURE equ PRINT_MODULE_ADDRESS + 3
 PRINT_MODULE_CHECKSUM equ PRINT_MODULE_ADDRESS + 12
+BASIC_MODULE_LBA equ PRINT_MODULE_LBA + PRINT_MODULE_SECTORS
+BASIC_MODULE_SECTORS equ 16
+BASIC_MODULE_ADDRESS equ 0x1000
+BASIC_MODULE_SIGNATURE equ BASIC_MODULE_ADDRESS + 3
+BASIC_MODULE_CHECKSUM equ BASIC_MODULE_ADDRESS + 12
+BUNDLED_APP_LBA equ BASIC_MODULE_LBA + BASIC_MODULE_SECTORS
+BUNDLED_APP_SECTORS equ 5
+BUNDLED_APP_HEADER equ STORAGE_HEADER_A
+BUNDLED_APP_LENGTH equ BUNDLED_APP_HEADER + 8
+BUNDLED_APP_CHECKSUM equ BUNDLED_APP_HEADER + 10
+BUNDLED_APP_NAME equ BUNDLED_APP_HEADER + 16
 
 ; The BIOS loads this first sector at 0000:7c00. Load the small real-mode
 ; kernel from the following sectors, then transfer control to it.
@@ -220,6 +230,11 @@ shell:
     jc command_edit_file
 
     mov si, SHELL_BUFFER
+    mov di, cmd_run_file
+    call prefix_equal
+    jc command_run_file
+
+    mov si, SHELL_BUFFER
     mov di, cmd_files
     call strings_equal
     jc command_files
@@ -392,6 +407,26 @@ command_edit_name:
 .exit:
     mov bx, cx
     mov si, newline
+    call print_string
+    jmp shell
+
+command_run_file:
+    ; A saved file overrides a bundled source file with the same name.
+    call filename_normalize
+    jc .valid
+    mov si, invalid_filename
+    call print_string
+    jmp shell
+.valid:
+    call file_open
+    jnc .missing
+    mov cx, bx
+    call basic_run
+    ; Ignore the LF that commonly follows an Enter used to dismiss BASIC.
+    mov bp, 1
+    jmp shell
+.missing:
+    mov si, file_not_found
     call print_string
     jmp shell
 
@@ -623,7 +658,7 @@ print_ipv4:
     xor ax, ax
     mov al, [si]
     inc si
-    call basic_print_unsigned
+    call print_unsigned
     pop cx
     dec cx
     jz .done
@@ -631,6 +666,29 @@ print_ipv4:
     call serial_write
     jmp .octet
 .done:
+    ret
+
+print_unsigned:
+    test ax, ax
+    jnz .divide
+    mov al, '0'
+    call serial_write
+    ret
+.divide:
+    xor cx, cx
+    mov bx, 10
+.next_digit:
+    xor dx, dx
+    div bx
+    push dx
+    inc cx
+    test ax, ax
+    jnz .next_digit
+.write_digit:
+    pop ax
+    add al, '0'
+    call serial_write
+    loop .write_digit
     ret
 
 ; Normalize a short filename from DS:SI into current_filename. Names are
@@ -720,11 +778,11 @@ file_find:
     clc
     ret
 
-; Open a saved file into the editor, or start a blank unsaved buffer when its
-; normalized name is not yet present. BX returns the document length.
+; Open a saved file into the editor. If it is absent, try the checked bundled
+; BASIC source before starting a blank unsaved buffer. BX returns the length.
 file_open:
     call file_find
-    jnc .new
+    jnc .bundled
     mov [current_file_index], al
     mov bx, [di + FILE_LENGTH]
     xor ah, ah
@@ -735,11 +793,77 @@ file_open:
     mov di, EDITOR_BUFFER
     rep movsb
     mov byte [di], 0
+    stc
     ret
+.bundled:
+    call bundled_file_open
+    jc .opened_bundled
 .new:
     mov byte [current_file_index], 0xff
     xor bx, bx
     mov byte [EDITOR_BUFFER], 0
+    clc
+    ret
+.opened_bundled:
+    mov byte [current_file_index], 0xff
+    stc
+    ret
+
+; Load the immutable bundled application only when its checked header names the
+; requested file. Its four source sectors map exactly onto the editor buffer,
+; so Ctrl-S can create an ordinary persistent user override without a special
+; on-disk file type.
+bundled_file_open:
+    push ax
+    push cx
+    push dx
+    push si
+    push di
+
+    mov bx, BUNDLED_APP_HEADER
+    mov cl, BUNDLED_APP_LBA
+    mov al, 1
+    call disk_read
+    jc .invalid
+    cmp dword [BUNDLED_APP_HEADER], 0x4158494e ; "NIXA"
+    jne .invalid
+    cmp word [BUNDLED_APP_HEADER + 4], 0x5050 ; "PP"
+    jne .invalid
+    cmp byte [BUNDLED_APP_HEADER + 6], '1'
+    jne .invalid
+    mov si, current_filename
+    mov di, BUNDLED_APP_NAME
+    call strings_equal
+    jnc .invalid
+    mov bx, [BUNDLED_APP_LENGTH]
+    cmp bx, EDITOR_CAPACITY - 1
+    ja .invalid
+
+    push bx
+    mov bx, EDITOR_BUFFER
+    mov cl, BUNDLED_APP_LBA + 1
+    mov si, BUNDLED_APP_SECTORS - 1
+    call storage_read_payload
+    pop bx
+    jc .invalid
+    mov si, EDITOR_BUFFER
+    mov cx, bx
+    call storage_checksum
+    cmp dx, [BUNDLED_APP_CHECKSUM]
+    jne .invalid
+    mov di, EDITOR_BUFFER
+    add di, bx
+    mov byte [di], 0
+    stc
+    jmp .restore
+.invalid:
+    clc
+.restore:
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop ax
     ret
 
 ; Initialize an empty in-memory directory and all eight fixed-size file slots.
@@ -1334,9 +1458,11 @@ storage_checksum:
     pop ax
     ret
 
-; Run the current editor buffer as a small, line-numbered BASIC program.
-; The editor's position and document length are preserved across execution.
+; Demand-load the checked BASIC runtime into the same 1000h-4fffh window used
+; by the printer module. The editor remains resident at 9c00h, and the module
+; ABI preserves the editor's position and document length for redraw.
 basic_run:
+    mov [basic_source_length], cx
     push ax
     push bx
     push cx
@@ -1345,192 +1471,38 @@ basic_run:
     push di
     push bp
 
-    mov si, basic_output
-    call print_string
-    mov di, BASIC_VARS
-    xor ax, ax
-    mov cx, 26
-    rep stosw
-    mov word [basic_steps], 10001
+    mov bx, BASIC_MODULE_ADDRESS
+    mov cl, BASIC_MODULE_LBA
+    mov si, BASIC_MODULE_SECTORS
+    call storage_read_payload
+    jc .unavailable
+    cmp dword [BASIC_MODULE_SIGNATURE], 0x4258494e ; "NIXB"
+    jne .unavailable
+    cmp dword [BASIC_MODULE_SIGNATURE + 4], 0x43495341 ; "ASIC"
+    jne .unavailable
+    cmp byte [BASIC_MODULE_SIGNATURE + 8], '1'
+    jne .unavailable
+    mov ax, [BASIC_MODULE_CHECKSUM]
+    mov [basic_module_checksum], ax
+    mov word [BASIC_MODULE_CHECKSUM], 0
+    mov si, BASIC_MODULE_ADDRESS
+    mov cx, BASIC_MODULE_SECTORS * 512
+    call storage_checksum
+    mov ax, [basic_module_checksum]
+    mov [BASIC_MODULE_CHECKSUM], ax
+    cmp dx, ax
+    jne .unavailable
+
     mov si, EDITOR_BUFFER
-
-.next_line:
-    call basic_skip_spaces
-    cmp byte [si], 0
-    je .finished
-    cmp byte [si], 13
-    je .blank
-
-    mov word [basic_line], 0
-    call basic_parse_uint
-    jnc .error
-    mov [basic_line], ax
-    dec word [basic_steps]
-    jz .error
-    call basic_skip_spaces
-
-    mov di, basic_kw_print
-    call basic_keyword
-    jc .print
-    mov di, basic_kw_let
-    call basic_keyword
-    jc .let
-    mov di, basic_kw_if
-    call basic_keyword
-    jc .if
-    mov di, basic_kw_goto
-    call basic_keyword
-    jc .goto
-    mov di, basic_kw_rem
-    call basic_keyword
-    jc .rem
-    mov di, basic_kw_end
-    call basic_keyword
-    jc .end
-    jmp .error
-
-.blank:
-    call basic_next_line
-    jmp .next_line
-
-.print:
-    call basic_skip_spaces
-    cmp byte [si], '"'
-    jne .print_number
-    inc si
-.print_text:
-    lodsb
-    test al, al
-    jz .error
-    cmp al, 13
-    je .error
-    cmp al, '"'
-    je .print_done
-    call serial_write
-    jmp .print_text
-.print_number:
-    call basic_expression
-    jnc .error
-    push ax
-    call basic_end_line
-    pop ax
-    jnc .error
-    call basic_print_integer
-    jmp .printed
-.print_done:
-    call basic_end_line
-    jnc .error
-.printed:
-    push si
-    mov si, newline
-    call print_string
-    pop si
-    jmp .next_line
-
-.let:
-    call basic_variable_address
-    jnc .error
-    push di
-    call basic_skip_spaces
-    cmp byte [si], '='
-    jne .let_error
-    inc si
-    call basic_expression
-    pop di
-    jnc .error
-    push ax
-    call basic_end_line
-    pop ax
-    jnc .error
-    mov [di], ax
-    jmp .next_line
-.let_error:
-    pop di
-    jmp .error
-
-.goto:
-    call basic_skip_spaces
-    call basic_parse_uint
-    jnc .error
-    mov dx, ax
-    call basic_end_line
-    jnc .error
-    call basic_find_line
-    jnc .error
-    jmp .next_line
-
-.if:
-    call basic_expression
-    jnc .error
-    mov [basic_left], ax
-    call basic_skip_spaces
-    mov al, [si]
-    cmp al, '='
-    je .have_operator
-    cmp al, '<'
-    je .have_operator
-    cmp al, '>'
-    jne .error
-.have_operator:
-    mov [basic_operator], al
-    inc si
-    call basic_expression
-    jnc .error
-    mov dx, ax
-    mov ax, [basic_left]
-    xor bx, bx
-    cmp byte [basic_operator], '='
-    je .if_equal
-    cmp byte [basic_operator], '<'
-    je .if_less
-    cmp ax, dx
-    jle .condition_ready
-    jmp .condition_true
-.if_less:
-    cmp ax, dx
-    jge .condition_ready
-    jmp .condition_true
-.if_equal:
-    cmp ax, dx
-    jne .condition_ready
-.condition_true:
-    inc bx
-.condition_ready:
-    mov di, basic_kw_then
-    call basic_keyword
-    jnc .error
-    call basic_skip_spaces
-    call basic_parse_uint
-    jnc .error
-    mov dx, ax
-    call basic_end_line
-    jnc .error
-    test bx, bx
-    jz .next_line
-    call basic_find_line
-    jnc .error
-    jmp .next_line
-
-.rem:
-    call basic_next_line
-    jmp .next_line
-
-.end:
-    call basic_end_line
-    jnc .error
-.finished:
-    mov si, basic_finished
-    jmp .pause
-.error:
-    mov si, basic_error
-    call print_string
-    mov ax, [basic_line]
-    call basic_print_unsigned
-    mov si, basic_error_end
-.pause:
+    mov cx, [basic_source_length]
+    mov dx, BASIC_MODULE_ADDRESS
+    call dx
+    jmp .restore
+.unavailable:
+    mov si, basic_module_error
     call print_string
     call serial_read
-
+.restore:
     pop bp
     pop di
     pop si
@@ -1538,268 +1510,6 @@ basic_run:
     pop cx
     pop bx
     pop ax
-    ret
-
-; Carry is set when the lowercase keyword at DI matches SI case-insensitively.
-; SI advances past the keyword only on a whole-word match.
-basic_keyword:
-    push bx
-    mov bx, si
-.compare:
-    mov al, [di]
-    test al, al
-    jz .boundary
-    mov ah, [si]
-    or ah, 0x20
-    cmp ah, al
-    jne .different
-    inc si
-    inc di
-    jmp .compare
-.boundary:
-    mov al, [si]
-    cmp al, ' '
-    je .matched
-    cmp al, 13
-    je .matched
-    test al, al
-    jz .matched
-.different:
-    mov si, bx
-    clc
-    pop bx
-    ret
-.matched:
-    stc
-    pop bx
-    ret
-
-basic_skip_spaces:
-    cmp byte [si], ' '
-    jne .done
-    inc si
-    jmp basic_skip_spaces
-.done:
-    ret
-
-; Parse an unsigned decimal at SI into AX.
-basic_parse_uint:
-    cmp byte [si], '0'
-    jb .invalid
-    cmp byte [si], '9'
-    ja .invalid
-    xor ax, ax
-.digit:
-    cmp byte [si], '0'
-    jb .valid
-    cmp byte [si], '9'
-    ja .valid
-    mov cx, 10
-    mul cx
-    test dx, dx
-    jnz .invalid
-    xor dx, dx
-    mov dl, [si]
-    sub dl, '0'
-    add ax, dx
-    jc .invalid
-    inc si
-    jmp .digit
-.valid:
-    stc
-    ret
-.invalid:
-    clc
-    ret
-
-; Parse a signed literal or single-letter variable into AX.
-basic_value:
-    call basic_skip_spaces
-    xor bx, bx
-    cmp byte [si], '-'
-    je .negative
-    cmp byte [si], '+'
-    jne .value
-    inc si
-    call basic_skip_spaces
-    jmp .value
-.negative:
-    inc si
-    inc bx
-    call basic_skip_spaces
-.value:
-    cmp byte [si], '0'
-    jb .variable
-    cmp byte [si], '9'
-    ja .variable
-    call basic_parse_uint
-    jnc .invalid
-    test bx, bx
-    jnz .negative_literal
-    cmp ax, 0x7fff
-    ja .invalid
-    jmp .valid
-.negative_literal:
-    cmp ax, 0x8000
-    ja .invalid
-    neg ax
-    jmp .valid
-.variable:
-    call basic_variable_address
-    jnc .invalid
-    mov ax, [di]
-    test bx, bx
-    jz .valid
-    neg ax
-.valid:
-    stc
-    ret
-.invalid:
-    clc
-    ret
-
-; Parse values joined by + or - from left to right.
-basic_expression:
-    call basic_value
-    jnc .invalid
-    mov dx, ax
-.operator:
-    call basic_skip_spaces
-    cmp byte [si], '+'
-    je .add
-    cmp byte [si], '-'
-    je .subtract
-    mov ax, dx
-    stc
-    ret
-.add:
-    inc si
-    push dx
-    call basic_value
-    pop dx
-    jnc .invalid
-    add dx, ax
-    jmp .operator
-.subtract:
-    inc si
-    push dx
-    call basic_value
-    pop dx
-    jnc .invalid
-    sub dx, ax
-    jmp .operator
-.invalid:
-    clc
-    ret
-
-; Return the address of a case-insensitive A-Z variable in DI.
-basic_variable_address:
-    call basic_skip_spaces
-    mov al, [si]
-    or al, 0x20
-    cmp al, 'a'
-    jb .invalid
-    cmp al, 'z'
-    ja .invalid
-    sub al, 'a'
-    xor ah, ah
-    shl ax, 1
-    mov di, BASIC_VARS
-    add di, ax
-    inc si
-    stc
-    ret
-.invalid:
-    clc
-    ret
-
-; Accept only spaces through the end of a statement and advance to the next.
-basic_end_line:
-    call basic_skip_spaces
-    cmp byte [si], 0
-    je .valid
-    cmp byte [si], 13
-    jne .invalid
-    inc si
-    cmp byte [si], 10
-    jne .valid
-    inc si
-.valid:
-    stc
-    ret
-.invalid:
-    clc
-    ret
-
-basic_next_line:
-    mov al, [si]
-    test al, al
-    jz .done
-    inc si
-    cmp al, 13
-    jne basic_next_line
-    cmp byte [si], 10
-    jne .done
-    inc si
-.done:
-    ret
-
-; Find the first physical line numbered DX and return its start in SI.
-basic_find_line:
-    mov si, EDITOR_BUFFER
-.scan:
-    call basic_skip_spaces
-    cmp byte [si], 0
-    je .missing
-    cmp byte [si], 13
-    je .advance
-    mov bx, si
-    push dx
-    call basic_parse_uint
-    pop dx
-    jnc .advance
-    cmp ax, dx
-    je .found
-.advance:
-    call basic_next_line
-    jmp .scan
-.found:
-    mov si, bx
-    stc
-    ret
-.missing:
-    clc
-    ret
-
-basic_print_integer:
-    test ax, ax
-    jns basic_print_unsigned
-    push ax
-    mov al, '-'
-    call serial_write
-    pop ax
-    neg ax
-basic_print_unsigned:
-    test ax, ax
-    jnz .divide
-    mov al, '0'
-    call serial_write
-    ret
-.divide:
-    xor cx, cx
-    mov bx, 10
-.next_digit:
-    xor dx, dx
-    div bx
-    push dx
-    inc cx
-    test ax, ax
-    jnz .next_digit
-.write_digit:
-    pop ax
-    add al, '0'
-    call serial_write
-    loop .write_digit
     ret
 
 command_clear:
@@ -1882,8 +1592,9 @@ prompt         db 'nix> ', 0
 newline        db 13, 10, 0
 erase          db 8, ' ', 8, 0
 unknown        db 'Unknown command.', 13, 10, 0
-help_text      db 'help files edit [filename] print <filename> printer [IPv4]', 13, 10
-               db 'clear echo <text> reboot halt', 13, 10, 0
+help_text      db 'help files edit [filename] run <filename>', 13, 10
+               db 'print <filename> printer [IPv4] clear echo <text> reboot halt', 13, 10
+               db 'Try: run TETRIS.BAS', 13, 10, 0
 editor_header  db 'Nixodria Editor: ', 0
 editor_controls db 13, 10, 'Ctrl-S save | Ctrl-R run | Ctrl-X exit | Ctrl-L clear', 13, 10, 0
 clear_sequence db 27, '[2J', 27, '[H', 0
@@ -1902,11 +1613,13 @@ printer_unavailable db 'Printer unavailable.', 13, 10, 0
 printer_rejected db 'Printer rejected job.', 13, 10, 0
 print_failed   db 'Print failed.', 13, 10, 0
 print_module_error db 'Printer module unavailable.', 13, 10, 0
+basic_module_error db 27, '[2J', 27, '[H', 'BASIC runtime unavailable. Press any key.', 0
 rebooting      db 'Rebooting...', 13, 10, 0
 halted         db 'Halted.', 13, 10, 0
 cmd_help       db 'help', 0
 cmd_edit       db 'edit', 0
 cmd_edit_file  db 'edit ', 0
+cmd_run_file   db 'run ', 0
 cmd_files      db 'files', 0
 cmd_print_file db 'print ', 0
 cmd_printer    db 'printer', 0
@@ -1915,17 +1628,6 @@ cmd_clear      db 'clear', 0
 cmd_reboot     db 'reboot', 0
 cmd_halt       db 'halt', 0
 cmd_echo       db 'echo ', 0
-basic_output   db 27, '[2J', 27, '[H', 'Nixodria BASIC', 13, 10, 13, 10, 0
-basic_finished db 13, 10, 'Program finished. Press any key.', 0
-basic_error    db 13, 10, 'BASIC error at line ', 0
-basic_error_end db '. Press any key.', 0
-basic_kw_print db 'print', 0
-basic_kw_let   db 'let', 0
-basic_kw_if    db 'if', 0
-basic_kw_goto  db 'goto', 0
-basic_kw_rem   db 'rem', 0
-basic_kw_end   db 'end', 0
-basic_kw_then  db 'then', 0
 default_filename db 'UNTITLED.TXT', 0
 current_filename times FILE_NAME_SIZE db 0
 editor_status  db 0
@@ -1947,19 +1649,17 @@ validation_index db 0
 disk_request   dw 0
 disk_buffer    dw 0
 disk_sector    db 0
-basic_line     dw 0
-basic_steps    dw 0
-basic_left     dw 0
-basic_operator db 0
 printer_ip     db 192, 168, 40, 220
 printer_candidate times 4 db 0
 print_file_index db 0
 print_file_length dw 0
 print_module_checksum dw 0
+basic_module_checksum dw 0
+basic_source_length dw 0
 
 ; Keep executable code inside the sectors loaded by the first-stage loader.
 times (1 + KERNEL_SECTORS) * 512 - ($ - $$) db 0
 
-; Pad the base image. The build overlays the native printer module after both
-; blank recovery snapshots without changing their established LBAs.
+; Pad the base image. The build overlays the native modules and bundled BASIC
+; source after both blank recovery snapshots without changing their LBAs.
 times IMAGE_SECTORS * 512 - ($ - $$) db 0

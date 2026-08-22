@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Refresh boot code and migrate or preserve Nixodria's file snapshots."""
+"""Refresh immutable OS/app regions and preserve Nixodria's file snapshots."""
 
 import os
 from pathlib import Path
@@ -110,7 +110,7 @@ def prepare_runtime_image(template: Path, runtime: Path) -> str:
             combined_bytes[STORAGE_OFFSET:STORAGE_END] = runtime_data[
                 STORAGE_OFFSET:STORAGE_END
             ]
-            action = "updated OS sectors and preserved saved files in"
+            action = "updated immutable sectors and preserved saved files in"
         combined = bytes(combined_bytes)
     else:
         combined = template_data
