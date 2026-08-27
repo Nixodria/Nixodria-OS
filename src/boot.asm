@@ -38,12 +38,14 @@ BASIC_MODULE_SECTORS equ 16
 BASIC_MODULE_ADDRESS equ 0x1000
 BASIC_MODULE_SIGNATURE equ BASIC_MODULE_ADDRESS + 3
 BASIC_MODULE_CHECKSUM equ BASIC_MODULE_ADDRESS + 12
-BUNDLED_APP_LBA equ BASIC_MODULE_LBA + BASIC_MODULE_SECTORS
-BUNDLED_APP_SECTORS equ 5
-BUNDLED_APP_HEADER equ STORAGE_HEADER_A
-BUNDLED_APP_LENGTH equ BUNDLED_APP_HEADER + 8
-BUNDLED_APP_CHECKSUM equ BUNDLED_APP_HEADER + 10
-BUNDLED_APP_NAME equ BUNDLED_APP_HEADER + 16
+PACKAGE_CATALOG_LBA equ BASIC_MODULE_LBA + BASIC_MODULE_SECTORS
+PACKAGE_SLOT_SECTORS equ 5
+PACKAGE_COUNT_MAX equ 8
+PACKAGE_HEADER  equ STORAGE_HEADER_A
+PACKAGE_LENGTH  equ PACKAGE_HEADER + 8
+PACKAGE_CHECKSUM equ PACKAGE_HEADER + 10
+PACKAGE_HEADER_CHECKSUM equ PACKAGE_HEADER + 12
+PACKAGE_NAME    equ PACKAGE_HEADER + 16
 
 ; The BIOS loads this first sector at 0000:7c00. Load the small real-mode
 ; kernel from the following sectors, then transfer control to it.
@@ -240,6 +242,21 @@ shell:
     jc command_files
 
     mov si, SHELL_BUFFER
+    mov di, cmd_pkg_list
+    call strings_equal
+    jc command_pkg_list
+
+    mov si, SHELL_BUFFER
+    mov di, cmd_pkg_install
+    call prefix_equal
+    jc command_pkg_install
+
+    mov si, SHELL_BUFFER
+    mov di, cmd_pkg_remove
+    call prefix_equal
+    jc command_pkg_remove
+
+    mov si, SHELL_BUFFER
     mov di, cmd_print_file
     call prefix_equal
     jc command_print_file
@@ -411,7 +428,6 @@ command_edit_name:
     jmp shell
 
 command_run_file:
-    ; A saved file overrides a bundled source file with the same name.
     call filename_normalize
     jc .valid
     mov si, invalid_filename
@@ -481,6 +497,142 @@ command_files:
     call print_string
     add di, FILE_ENTRY_SIZE
     loop .next
+    jmp shell
+
+command_pkg_list:
+    mov byte [package_index], 0
+    mov byte [package_count], 0
+    mov di, HEADER_BACKUP
+.scan:
+    mov al, [package_index]
+    call package_load_header
+    jc .catalog_error
+    test al, al
+    jz .advance
+    mov al, [package_count]
+    cmp al, [package_index]
+    jne .catalog_error
+    mov si, PACKAGE_NAME
+    mov cx, FILE_NAME_SIZE
+    rep movsb
+    inc byte [package_count]
+.advance:
+    inc byte [package_index]
+    cmp byte [package_index], PACKAGE_COUNT_MAX
+    jb .scan
+.ready:
+    cmp byte [package_count], 0
+    je .none
+    mov si, packages_heading
+    call print_string
+    xor ch, ch
+    mov cl, [package_count]
+    mov di, HEADER_BACKUP
+.print:
+    mov si, di
+    call print_string
+    mov si, newline
+    call print_string
+    add di, FILE_NAME_SIZE
+    loop .print
+    jmp shell
+.none:
+    mov si, no_packages
+    call print_string
+    jmp shell
+.catalog_error:
+    mov si, package_catalog_error
+    call print_string
+    jmp shell
+
+command_pkg_install:
+    call filename_normalize
+    jc .valid_name
+    mov si, invalid_filename
+    call print_string
+    jmp shell
+.valid_name:
+    call package_find
+    jc .found_package
+    test al, al
+    jnz .catalog_error
+    mov si, package_not_found
+    call print_string
+    jmp shell
+.found_package:
+    call file_find
+    jnc .load
+    mov si, package_already_installed
+    call print_string
+    jmp shell
+.load:
+    mov ax, [PACKAGE_LENGTH]
+    mov [package_source_length], ax
+    mov ax, [PACKAGE_CHECKSUM]
+    mov [package_source_checksum], ax
+    xor ah, ah
+    mov al, [package_index]
+    mov bl, PACKAGE_SLOT_SECTORS
+    mul bl
+    add al, PACKAGE_CATALOG_LBA + 1
+    mov cl, al
+    mov bx, EDITOR_BUFFER
+    mov si, PACKAGE_SLOT_SECTORS - 1
+    call storage_read_payload
+    jc .failed
+    mov si, EDITOR_BUFFER
+    mov cx, [package_source_length]
+    call storage_checksum
+    cmp dx, [package_source_checksum]
+    jne .failed
+    mov di, EDITOR_BUFFER
+    add di, [package_source_length]
+    mov byte [di], 0
+    mov byte [current_file_index], 0xff
+    mov cx, [package_source_length]
+    call file_save
+    jnc .installed
+    cmp byte [save_error], 1
+    je .full
+.failed:
+    mov si, package_install_failed
+    call print_string
+    jmp shell
+.full:
+    mov si, storage_full
+    call print_string
+    jmp shell
+.installed:
+    mov si, package_installed
+    call print_string
+    jmp shell
+.catalog_error:
+    mov si, package_catalog_error
+    call print_string
+    jmp shell
+
+command_pkg_remove:
+    call filename_normalize
+    jc .valid_name
+    mov si, invalid_filename
+    call print_string
+    jmp shell
+.valid_name:
+    call file_find
+    jc .installed
+    mov si, package_not_installed
+    call print_string
+    jmp shell
+.installed:
+    mov [remove_index], al
+    call file_remove
+    jnc .removed
+    mov si, package_remove_failed
+    call print_string
+    jmp shell
+.removed:
+    mov si, package_removed
+    call print_string
     jmp shell
 
 ; Load the native network/print module only when it is needed, then give it the
@@ -778,11 +930,11 @@ file_find:
     clc
     ret
 
-; Open a saved file into the editor. If it is absent, try the checked bundled
-; BASIC source before starting a blank unsaved buffer. BX returns the length.
+; Open a saved file into the editor or start a blank unsaved buffer. BX returns
+; the length and carry distinguishes an existing file from a new one.
 file_open:
     call file_find
-    jnc .bundled
+    jnc .new
     mov [current_file_index], al
     mov bx, [di + FILE_LENGTH]
     xor ah, ah
@@ -795,77 +947,200 @@ file_open:
     mov byte [di], 0
     stc
     ret
-.bundled:
-    call bundled_file_open
-    jc .opened_bundled
 .new:
     mov byte [current_file_index], 0xff
     xor bx, bx
     mov byte [EDITOR_BUFFER], 0
     clc
     ret
-.opened_bundled:
-    mov byte [current_file_index], 0xff
-    stc
-    ret
 
-; Load the immutable bundled application only when its checked header names the
-; requested file. Its four source sectors map exactly onto the editor buffer,
-; so Ctrl-S can create an ordinary persistent user override without a special
-; on-disk file type.
-bundled_file_open:
-    push ax
+; Read and validate package slot AL. AL returns zero for the first empty slot or
+; one for a valid package; carry reports an unreadable or malformed header.
+package_load_header:
+    push bx
     push cx
     push dx
     push si
     push di
-
-    mov bx, BUNDLED_APP_HEADER
-    mov cl, BUNDLED_APP_LBA
+    mov [package_index], al
+    xor ah, ah
+    mov bl, PACKAGE_SLOT_SECTORS
+    mul bl
+    add ax, PACKAGE_CATALOG_LBA
+    mov cl, al
+    mov bx, PACKAGE_HEADER
     mov al, 1
     call disk_read
     jc .invalid
-    cmp dword [BUNDLED_APP_HEADER], 0x4158494e ; "NIXA"
-    jne .invalid
-    cmp word [BUNDLED_APP_HEADER + 4], 0x5050 ; "PP"
-    jne .invalid
-    cmp byte [BUNDLED_APP_HEADER + 6], '1'
-    jne .invalid
-    mov si, current_filename
-    mov di, BUNDLED_APP_NAME
-    call strings_equal
-    jnc .invalid
-    mov bx, [BUNDLED_APP_LENGTH]
-    cmp bx, EDITOR_CAPACITY - 1
-    ja .invalid
-
-    push bx
+    cmp byte [PACKAGE_HEADER], 0
+    jne .present
+    mov dl, cl
+    mov si, PACKAGE_HEADER
+    mov cx, 512
+.empty_header:
+    lodsb
+    test al, al
+    jnz .invalid
+    loop .empty_header
+    mov cl, dl
+    inc cl
     mov bx, EDITOR_BUFFER
-    mov cl, BUNDLED_APP_LBA + 1
-    mov si, BUNDLED_APP_SECTORS - 1
+    mov si, PACKAGE_SLOT_SECTORS - 1
     call storage_read_payload
-    pop bx
     jc .invalid
     mov si, EDITOR_BUFFER
-    mov cx, bx
-    call storage_checksum
-    cmp dx, [BUNDLED_APP_CHECKSUM]
-    jne .invalid
-    mov di, EDITOR_BUFFER
-    add di, bx
-    mov byte [di], 0
-    stc
+    mov cx, EDITOR_CAPACITY
+.empty_payload:
+    lodsb
+    test al, al
+    jnz .invalid
+    loop .empty_payload
+    xor al, al
+    clc
+    jmp .restore
+.present:
+    call package_header_valid
+    jc .invalid
+    mov al, 1
+    clc
     jmp .restore
 .invalid:
-    clc
+    mov al, 2
+    stc
 .restore:
     pop di
     pop si
     pop dx
     pop cx
-    pop ax
+    pop bx
     ret
 
+; Validate the fixed header, its CRC, canonical padded filename, and every
+; reserved byte. The source CRC is checked separately after payload loading.
+package_header_valid:
+    cmp dword [PACKAGE_HEADER], 0x5058494e ; "NIXP"
+    jne .invalid
+    cmp dword [PACKAGE_HEADER + 4], 0x0031474b ; "KG1", NUL
+    jne .invalid
+    mov ax, [PACKAGE_HEADER_CHECKSUM]
+    mov [package_header_checksum], ax
+    mov word [PACKAGE_HEADER_CHECKSUM], 0
+    mov si, PACKAGE_HEADER
+    mov cx, 512
+    call storage_checksum
+    mov ax, [package_header_checksum]
+    mov [PACKAGE_HEADER_CHECKSUM], ax
+    cmp dx, ax
+    jne .invalid
+    cmp word [PACKAGE_LENGTH], 0
+    je .invalid
+    cmp word [PACKAGE_LENGTH], EDITOR_CAPACITY - 1
+    ja .invalid
+    cmp word [PACKAGE_HEADER + 14], 0
+    jne .invalid
+
+    mov si, PACKAGE_NAME
+    mov cx, FILE_NAME_SIZE
+    xor bx, bx
+.name:
+    lodsb
+    dec cx
+    test al, al
+    jz .padding
+    cmp bl, FILE_NAME_SIZE - 1
+    jae .invalid
+    cmp al, 'A'
+    jb .not_letter
+    cmp al, 'Z'
+    jbe .name_byte
+.not_letter:
+    cmp al, '0'
+    jb .punctuation
+    cmp al, '9'
+    jbe .name_byte
+.punctuation:
+    cmp al, '.'
+    je .name_byte
+    cmp al, '_'
+    je .name_byte
+    cmp al, '-'
+    jne .invalid
+.name_byte:
+    inc bx
+    test cx, cx
+    jnz .name
+    jmp .invalid
+.padding:
+    cmp bx, 5
+    jb .invalid
+    mov di, PACKAGE_NAME
+    add di, bx
+    cmp dword [di - 4], 0x5341422e ; ".BAS"
+    jne .invalid
+.padding_byte:
+    jcxz .reserved
+    lodsb
+    test al, al
+    jnz .invalid
+    dec cx
+    jmp .padding_byte
+.reserved:
+    mov si, PACKAGE_HEADER + 16 + FILE_NAME_SIZE
+    mov cx, 512 - 16 - FILE_NAME_SIZE
+.reserved_byte:
+    lodsb
+    test al, al
+    jnz .invalid
+    loop .reserved_byte
+    clc
+    ret
+.invalid:
+    stc
+    ret
+
+; Find current_filename in the checked contiguous catalog. Carry means found.
+; On a miss AL=0; an invalid catalog returns AL=1 with carry clear.
+package_find:
+    mov byte [package_index], 0
+    mov byte [package_count], 0
+    mov byte [package_match], 0xff
+.next:
+    mov al, [package_index]
+    call package_load_header
+    jc .catalog_error
+    test al, al
+    jz .advance
+    mov al, [package_count]
+    cmp al, [package_index]
+    jne .catalog_error
+    inc byte [package_count]
+    mov si, current_filename
+    mov di, PACKAGE_NAME
+    call strings_equal
+    jnc .advance
+    cmp byte [package_match], 0xff
+    jne .catalog_error
+    mov al, [package_index]
+    mov [package_match], al
+.advance:
+    inc byte [package_index]
+    cmp byte [package_index], PACKAGE_COUNT_MAX
+    jb .next
+    mov al, [package_match]
+    cmp al, 0xff
+    je .missing
+    call package_load_header
+    jc .catalog_error
+    stc
+    ret
+.missing:
+    xor ax, ax
+    clc
+    ret
+.catalog_error:
+    mov al, 1
+    clc
+    ret
 ; Initialize an empty in-memory directory and all eight fixed-size file slots.
 files_initialize:
     push ax
@@ -1241,6 +1516,110 @@ file_save_rollback:
     mov [current_file_index], al
     ret
 
+; Delete remove_index from the compact directory and data array, then commit the
+; complete result through the normal alternating-snapshot transaction. Keep the
+; removed slot and directory in RAM so a failed write never depends on disk
+; reads to restore the live filesystem.
+file_remove:
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+    push bp
+    mov si, FILES_HEADER
+    mov di, HEADER_BACKUP
+    mov cx, 256
+    rep movsw
+    mov al, [remove_index]
+    call files_data_address
+    mov si, di
+    mov di, FILE_BACKUP
+    mov cx, EDITOR_CAPACITY / 2
+    rep movsw
+
+    mov al, [FILES_HEADER + 6]
+    dec al
+    mov [remove_last], al
+    mov al, [remove_index]
+    mov [remove_cursor], al
+.compact:
+    mov al, [remove_cursor]
+    cmp al, [remove_last]
+    jae .clear_last
+    inc al
+    call files_entry_address
+    mov si, di
+    mov al, [remove_cursor]
+    call files_entry_address
+    mov cx, FILE_ENTRY_SIZE
+    rep movsb
+
+    mov al, [remove_cursor]
+    inc al
+    call files_data_address
+    mov si, di
+    mov al, [remove_cursor]
+    call files_data_address
+    mov cx, EDITOR_CAPACITY / 2
+    rep movsw
+    inc byte [remove_cursor]
+    jmp .compact
+.clear_last:
+    mov al, [remove_last]
+    call files_entry_address
+    xor ax, ax
+    mov cx, FILE_ENTRY_SIZE
+    rep stosb
+    mov al, [remove_last]
+    call files_data_address
+    xor ax, ax
+    mov cx, EDITOR_CAPACITY / 2
+    rep stosw
+    dec byte [FILES_HEADER + 6]
+    call storage_save
+    jc .failed
+    mov byte [current_file_index], 0xff
+    clc
+    jmp .restore
+.failed:
+    mov al, [remove_last]
+.rollback_data:
+    cmp al, [remove_index]
+    jbe .restore_removed
+    mov dl, al
+    dec al
+    call files_data_address
+    mov si, di
+    mov al, dl
+    call files_data_address
+    mov cx, EDITOR_CAPACITY / 2
+    rep movsw
+    mov al, dl
+    dec al
+    jmp .rollback_data
+.restore_removed:
+    mov al, [remove_index]
+    call files_data_address
+    mov si, FILE_BACKUP
+    mov cx, EDITOR_CAPACITY / 2
+    rep movsw
+    mov si, HEADER_BACKUP
+    mov di, FILES_HEADER
+    mov cx, 256
+    rep movsw
+    stc
+.restore:
+    pop bp
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
 ; Return DI pointing at directory entry AL in the active header.
 files_entry_address:
     xor ah, ah
@@ -1593,8 +1972,8 @@ newline        db 13, 10, 0
 erase          db 8, ' ', 8, 0
 unknown        db 'Unknown command.', 13, 10, 0
 help_text      db 'help files edit [filename] run <filename>', 13, 10
-               db 'print <filename> printer [IPv4] clear echo <text> reboot halt', 13, 10
-               db 'Try: run TETRIS.BAS', 13, 10, 0
+               db 'pkg list pkg install <filename> pkg remove <filename>', 13, 10
+               db 'print <filename> printer [IPv4] clear echo <text> reboot halt', 13, 10, 0
 editor_header  db 'Nixodria Editor: ', 0
 editor_controls db 13, 10, 'Ctrl-S save | Ctrl-R run | Ctrl-X exit | Ctrl-L clear', 13, 10, 0
 clear_sequence db 27, '[2J', 27, '[H', 0
@@ -1605,6 +1984,16 @@ invalid_filename db 'Invalid filename.', 13, 10, 0
 files_heading  db 'Files:', 13, 10, 0
 no_files       db 'No files.', 13, 10, 0
 file_not_found db 'File not found.', 13, 10, 0
+packages_heading db 'Packages:', 13, 10, 0
+no_packages    db 'No packages.', 13, 10, 0
+package_installed db 'Package installed.', 13, 10, 0
+package_removed db 'Package removed.', 13, 10, 0
+package_already_installed db 'Package already installed.', 13, 10, 0
+package_not_found db 'Package not found.', 13, 10, 0
+package_not_installed db 'Package is not installed.', 13, 10, 0
+package_catalog_error db 'Package catalog unavailable.', 13, 10, 0
+package_install_failed db 'Package install failed.', 13, 10, 0
+package_remove_failed db 'Package remove failed.', 13, 10, 0
 printer_heading db 'Printer: ', 0
 printer_configured db 'Printer configured.', 13, 10, 0
 invalid_address db 'Invalid IPv4 address.', 13, 10, 0
@@ -1621,6 +2010,9 @@ cmd_edit       db 'edit', 0
 cmd_edit_file  db 'edit ', 0
 cmd_run_file   db 'run ', 0
 cmd_files      db 'files', 0
+cmd_pkg_list   db 'pkg list', 0
+cmd_pkg_install db 'pkg install ', 0
+cmd_pkg_remove db 'pkg remove ', 0
 cmd_print_file db 'print ', 0
 cmd_printer    db 'printer', 0
 cmd_printer_set db 'printer ', 0
@@ -1646,6 +2038,15 @@ save_old_index db 0xff
 save_file_index db 0
 validation_header dw 0
 validation_index db 0
+package_index  db 0
+package_count  db 0
+package_match  db 0xff
+package_header_checksum dw 0
+package_source_length dw 0
+package_source_checksum dw 0
+remove_index   db 0
+remove_last    db 0
+remove_cursor  db 0
 disk_request   dw 0
 disk_buffer    dw 0
 disk_sector    db 0
@@ -1660,6 +2061,6 @@ basic_source_length dw 0
 ; Keep executable code inside the sectors loaded by the first-stage loader.
 times (1 + KERNEL_SECTORS) * 512 - ($ - $$) db 0
 
-; Pad the base image. The build overlays the native modules and bundled BASIC
-; source after both blank recovery snapshots without changing their LBAs.
+; Pad the base image. The build overlays the native modules and package catalog
+; after both blank recovery snapshots without changing their LBAs.
 times IMAGE_SECTORS * 512 - ($ - $$) db 0

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install Nixodria's immutable modules and bundled app into its floppy image."""
+"""Install Nixodria's immutable modules and package catalog into its image."""
 
 from pathlib import Path
 import sys
@@ -12,7 +12,8 @@ SNAPSHOT_SECTORS = 33
 SNAPSHOT_COUNT = 2
 PRINT_MODULE_SECTORS = 32
 BASIC_MODULE_SECTORS = 16
-APP_SLOT_SECTORS = 5
+PACKAGE_SLOT_SECTORS = 5
+PACKAGE_SLOTS = 8
 IMAGE_SIZE = SECTOR_SIZE * IMAGE_SECTORS
 PRINT_OFFSET = SECTOR_SIZE * (
     SYSTEM_SECTORS + SNAPSHOT_COUNT * SNAPSHOT_SECTORS
@@ -22,20 +23,20 @@ PRINT_END = PRINT_OFFSET + PRINT_SIZE
 BASIC_OFFSET = PRINT_END
 BASIC_SIZE = SECTOR_SIZE * BASIC_MODULE_SECTORS
 BASIC_END = BASIC_OFFSET + BASIC_SIZE
-APP_OFFSET = BASIC_END
-APP_SIZE = SECTOR_SIZE * APP_SLOT_SECTORS
-APP_END = APP_OFFSET + APP_SIZE
+PACKAGE_OFFSET = BASIC_END
+PACKAGE_SIZE = SECTOR_SIZE * PACKAGE_SLOT_SECTORS * PACKAGE_SLOTS
+PACKAGE_END = PACKAGE_OFFSET + PACKAGE_SIZE
 MODULE_SIGNATURE_OFFSET = 3
 MODULE_CHECKSUM_OFFSET = 12
 PRINT_SIGNATURE = b"NIXPRINT1"
 BASIC_SIGNATURE = b"NIXBASIC1"
-APP_SIGNATURE = b"NIXAPP1"
-APP_SOURCE_LENGTH_OFFSET = 8
-APP_SOURCE_CHECKSUM_OFFSET = 10
-APP_FILENAME_OFFSET = 16
-APP_FILENAME_SIZE = 13
-APP_FILENAME = b"TETRIS.BAS"
-APP_SOURCE_MAX = (APP_SLOT_SECTORS - 1) * SECTOR_SIZE - 1
+PACKAGE_SIGNATURE = b"NIXPKG1\0"
+PACKAGE_SOURCE_LENGTH_OFFSET = 8
+PACKAGE_SOURCE_CHECKSUM_OFFSET = 10
+PACKAGE_HEADER_CHECKSUM_OFFSET = 12
+PACKAGE_FILENAME_OFFSET = 16
+PACKAGE_FILENAME_SIZE = 13
+PACKAGE_SOURCE_MAX = (PACKAGE_SLOT_SECTORS - 1) * SECTOR_SIZE - 1
 
 
 class ImageError(RuntimeError):
@@ -52,22 +53,6 @@ def checksum16(data: bytes) -> int:
             else:
                 checksum = (checksum << 1) & 0xFFFF
     return checksum
-
-
-def normalize_basic_source(source: bytes) -> bytes:
-    if b"\r" in source:
-        raise ImageError("bundled BASIC source contains a carriage return")
-    if b"\0" in source:
-        raise ImageError("bundled BASIC source contains a NUL byte")
-    if any(value > 0x7F for value in source):
-        raise ImageError("bundled BASIC source is not ASCII")
-    normalized = source.replace(b"\n", b"\r\n")
-    if len(normalized) > APP_SOURCE_MAX:
-        raise ImageError(
-            f"normalized BASIC source is {len(normalized)} bytes; "
-            f"maximum is {APP_SOURCE_MAX}"
-        )
-    return normalized
 
 
 def build_module_slot(
@@ -102,44 +87,125 @@ def build_module_slot(
     return bytes(slot), checksum
 
 
-def build_app_slot(source: bytes) -> tuple[bytes, int, int]:
-    normalized = normalize_basic_source(source)
-    checksum = checksum16(normalized)
-    slot = bytearray(APP_SIZE)
-    slot[: len(APP_SIGNATURE)] = APP_SIGNATURE
-    slot[
-        APP_SOURCE_LENGTH_OFFSET : APP_SOURCE_LENGTH_OFFSET + 2
-    ] = len(normalized).to_bytes(2, "little")
-    slot[
-        APP_SOURCE_CHECKSUM_OFFSET : APP_SOURCE_CHECKSUM_OFFSET + 2
-    ] = checksum.to_bytes(2, "little")
-    slot[
-        APP_FILENAME_OFFSET : APP_FILENAME_OFFSET + APP_FILENAME_SIZE
-    ] = APP_FILENAME.ljust(APP_FILENAME_SIZE, b"\0")
-    slot[SECTOR_SIZE : SECTOR_SIZE + len(normalized)] = normalized
-    return bytes(slot), checksum, len(normalized)
+def package_filename(header: bytes, slot_index: int) -> bytes:
+    field = header[
+        PACKAGE_FILENAME_OFFSET : PACKAGE_FILENAME_OFFSET + PACKAGE_FILENAME_SIZE
+    ]
+    name, separator, padding = field.partition(b"\0")
+    if not separator or not name or padding.strip(b"\0"):
+        raise ImageError(f"package slot {slot_index} has an invalid filename field")
+    if len(name) > PACKAGE_FILENAME_SIZE - 1 or not name.endswith(b".BAS"):
+        raise ImageError(f"package slot {slot_index} has an invalid BASIC filename")
+    if any(
+        not (
+            ord("A") <= value <= ord("Z")
+            or ord("0") <= value <= ord("9")
+            or value in b"._-"
+        )
+        for value in name
+    ):
+        raise ImageError(f"package slot {slot_index} has an invalid filename")
+    return name
+
+
+def validate_package_catalog(catalog: bytes) -> tuple[bytes, ...]:
+    if len(catalog) != PACKAGE_SIZE:
+        raise ImageError(
+            f"package catalog is {len(catalog)} bytes; expected {PACKAGE_SIZE}"
+        )
+
+    names: list[bytes] = []
+    found_empty = False
+    slot_size = PACKAGE_SLOT_SECTORS * SECTOR_SIZE
+    for slot_index in range(PACKAGE_SLOTS):
+        start = slot_index * slot_size
+        slot = catalog[start : start + slot_size]
+        if not any(slot):
+            found_empty = True
+            continue
+        if found_empty:
+            raise ImageError("package catalog has a populated slot after an empty slot")
+
+        header = slot[:SECTOR_SIZE]
+        payload = slot[SECTOR_SIZE:]
+        if header[: len(PACKAGE_SIGNATURE)] != PACKAGE_SIGNATURE:
+            raise ImageError(f"package slot {slot_index} has an invalid signature")
+        if any(header[14:16]) or any(
+            header[PACKAGE_FILENAME_OFFSET + PACKAGE_FILENAME_SIZE :]
+        ):
+            raise ImageError(f"package slot {slot_index} has nonzero reserved bytes")
+
+        stored_header_checksum = int.from_bytes(
+            header[
+                PACKAGE_HEADER_CHECKSUM_OFFSET : PACKAGE_HEADER_CHECKSUM_OFFSET + 2
+            ],
+            "little",
+        )
+        unchecked_header = bytearray(header)
+        unchecked_header[
+            PACKAGE_HEADER_CHECKSUM_OFFSET : PACKAGE_HEADER_CHECKSUM_OFFSET + 2
+        ] = b"\0\0"
+        if stored_header_checksum != checksum16(unchecked_header):
+            raise ImageError(f"package slot {slot_index} header checksum is invalid")
+
+        name = package_filename(header, slot_index)
+        if name in names:
+            raise ImageError(f"package catalog repeats {name.decode('ascii')}")
+        names.append(name)
+
+        source_length = int.from_bytes(
+            header[
+                PACKAGE_SOURCE_LENGTH_OFFSET : PACKAGE_SOURCE_LENGTH_OFFSET + 2
+            ],
+            "little",
+        )
+        if source_length > PACKAGE_SOURCE_MAX:
+            raise ImageError(f"package {name.decode('ascii')} is too large")
+        source = payload[:source_length]
+        if not source or b"\0" in source or any(value > 0x7F for value in source):
+            raise ImageError(f"package {name.decode('ascii')} is not ASCII BASIC source")
+        if b"\n" in source.replace(b"\r\n", b"") or b"\r" in source.replace(
+            b"\r\n", b""
+        ):
+            raise ImageError(
+                f"package {name.decode('ascii')} does not use canonical CRLF lines"
+            )
+        stored_source_checksum = int.from_bytes(
+            header[
+                PACKAGE_SOURCE_CHECKSUM_OFFSET : PACKAGE_SOURCE_CHECKSUM_OFFSET + 2
+            ],
+            "little",
+        )
+        if stored_source_checksum != checksum16(source):
+            raise ImageError(f"package {name.decode('ascii')} checksum is invalid")
+        if any(payload[source_length:]):
+            raise ImageError(f"package {name.decode('ascii')} padding is not blank")
+
+    if not names:
+        raise ImageError("package catalog is empty")
+    return tuple(names)
 
 
 def build_image(
     base_path: Path,
     print_path: Path,
     basic_path: Path,
-    source_path: Path,
+    catalog_path: Path,
     output_path: Path,
 ) -> str:
     base = base_path.read_bytes()
     print_module = print_path.read_bytes()
     basic_module = basic_path.read_bytes()
-    source = source_path.read_bytes()
+    catalog = catalog_path.read_bytes()
     if len(base) != IMAGE_SIZE:
         raise ImageError(
             f"base image is {len(base)} bytes; expected {IMAGE_SIZE}"
         )
     if base[SECTOR_SIZE - 2 : SECTOR_SIZE] != b"\x55\xaa":
         raise ImageError("base image has no BIOS signature")
-    if any(base[PRINT_OFFSET:APP_END]):
+    if any(base[PRINT_OFFSET:PACKAGE_END]):
         raise ImageError("base image immutable-module region is not blank")
-    if any(base[APP_END:]):
+    if any(base[PACKAGE_END:]):
         raise ImageError("base image unused floppy sectors are not blank")
 
     print_slot, print_checksum = build_module_slot(
@@ -148,18 +214,19 @@ def build_image(
     basic_slot, basic_checksum = build_module_slot(
         basic_module, BASIC_SIZE, BASIC_SIGNATURE, "BASIC"
     )
-    app_slot, app_checksum, app_source_length = build_app_slot(source)
+    package_names = validate_package_catalog(catalog)
 
     image = bytearray(base)
     image[PRINT_OFFSET:PRINT_END] = print_slot
     image[BASIC_OFFSET:BASIC_END] = basic_slot
-    image[APP_OFFSET:APP_END] = app_slot
+    image[PACKAGE_OFFSET:PACKAGE_END] = catalog
     output_path.write_bytes(image)
+    rendered_packages = ", ".join(name.decode("ascii") for name in package_names)
     return (
         f"image: installed {len(print_module)}-byte printer module "
         f"(CRC-16 {print_checksum:04x}), {len(basic_module)}-byte BASIC module "
-        f"(CRC-16 {basic_checksum:04x}), and {app_source_length}-byte TETRIS.BAS "
-        f"(CRC-16 {app_checksum:04x}) in {output_path}"
+        f"(CRC-16 {basic_checksum:04x}), and {len(package_names)} packages "
+        f"({rendered_packages}) in {output_path}"
     )
 
 
@@ -167,7 +234,7 @@ def main() -> int:
     if len(sys.argv) != 6:
         print(
             f"usage: {Path(sys.argv[0]).name} BASE PRINT_MODULE BASIC_MODULE "
-            "TETRIS_SOURCE OUTPUT",
+            "PACKAGE_CATALOG OUTPUT",
             file=sys.stderr,
         )
         return 2

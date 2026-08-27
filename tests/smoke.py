@@ -27,6 +27,18 @@ SNAPSHOT_LBAS = (SYSTEM_SECTORS, SYSTEM_SECTORS + SNAPSHOT_SECTORS)
 STORAGE_END = STORAGE_OFFSET + 2 * SNAPSHOT_SIZE
 PRINT_MODULE_SECTORS = 32
 BASIC_MODULE_OFFSET = STORAGE_END + PRINT_MODULE_SECTORS * SECTOR_SIZE
+BASIC_MODULE_SECTORS = 16
+PACKAGE_CATALOG_OFFSET = BASIC_MODULE_OFFSET + BASIC_MODULE_SECTORS * SECTOR_SIZE
+PACKAGE_SLOT_SECTORS = 5
+PACKAGE_SLOT_SIZE = PACKAGE_SLOT_SECTORS * SECTOR_SIZE
+PACKAGE_SLOTS = 8
+PACKAGE_CATALOG_END = PACKAGE_CATALOG_OFFSET + PACKAGE_SLOTS * PACKAGE_SLOT_SIZE
+PACKAGE_SIGNATURE = b"NIXPKG1\0"
+PACKAGE_LENGTH_OFFSET = 8
+PACKAGE_SOURCE_CHECKSUM_OFFSET = 10
+PACKAGE_HEADER_CHECKSUM_OFFSET = 12
+PACKAGE_FILENAME_OFFSET = 16
+PACKAGE_FILENAME_SIZE = 13
 IMAGE_SIZE = IMAGE_SECTORS * SECTOR_SIZE
 STORAGE_MAGIC = b"NIX3"
 LEGACY_STORAGE_MAGIC = b"NIX2"
@@ -50,7 +62,6 @@ BASIC_FINISHED = b"\r\nProgram finished. Press any key."
 TETRIS_TITLE = b"TETRIS"
 TETRIS_GAME_OVER = b"GAME OVER"
 TETRIS_CONTROLS = b"a d w s space q"
-TETRIS_SOURCE = Path(__file__).resolve().parents[1] / "apps" / "TETRIS.BAS"
 TETRIS_FULL_ROW = (1 << 10) - 1
 
 
@@ -61,6 +72,13 @@ class TetrisScreen:
     score: int
     lines: int
     game_over: bool = False
+
+
+@dataclass(frozen=True)
+class Package:
+    slot: int
+    filename: bytes
+    source: bytes
 
 
 def normalize_filename(filename: bytes) -> bytes:
@@ -469,6 +487,22 @@ def assert_files(
     return session.wait_for(b"files\r\n" + listing + b"nix> ", start)
 
 
+def assert_packages(
+    session: QemuSession,
+    expected: tuple[bytes, ...],
+    start: int,
+    enter: bytes = b"\r",
+) -> int:
+    session.write(b"pkg list" + enter)
+    if expected:
+        listing = b"Packages:\r\n" + b"".join(
+            normalize_filename(name) + b"\r\n" for name in expected
+        )
+    else:
+        listing = b"No packages.\r\n"
+    return session.wait_for(b"pkg list\r\n" + listing + b"nix> ", start)
+
+
 def checksum16(data: bytes) -> int:
     checksum = 0xFFFF
     for value in data:
@@ -479,6 +513,120 @@ def checksum16(data: bytes) -> int:
             else:
                 checksum = (checksum << 1) & 0xFFFF
     return checksum
+
+
+def extract_packages(image: bytes) -> tuple[Package, ...]:
+    if len(image) != IMAGE_SIZE:
+        raise SmokeFailure(
+            f"package source image is {len(image)} bytes; expected {IMAGE_SIZE}"
+        )
+    if PACKAGE_CATALOG_OFFSET != 125 * SECTOR_SIZE:
+        raise SmokeFailure("package catalog does not begin at LBA 125")
+    if PACKAGE_CATALOG_END != 165 * SECTOR_SIZE:
+        raise SmokeFailure("package catalog does not end after LBA 164")
+
+    packages: list[Package] = []
+    names: set[bytes] = set()
+    found_empty = False
+    for slot_index in range(PACKAGE_SLOTS):
+        start = PACKAGE_CATALOG_OFFSET + slot_index * PACKAGE_SLOT_SIZE
+        slot = image[start : start + PACKAGE_SLOT_SIZE]
+        if not any(slot):
+            found_empty = True
+            continue
+        if found_empty:
+            raise SmokeFailure("package catalog is not contiguous")
+
+        header = slot[:SECTOR_SIZE]
+        payload = slot[SECTOR_SIZE:]
+        if header[: len(PACKAGE_SIGNATURE)] != PACKAGE_SIGNATURE:
+            raise SmokeFailure(f"package slot {slot_index} has an invalid signature")
+        if any(header[14:16]) or any(
+            header[PACKAGE_FILENAME_OFFSET + PACKAGE_FILENAME_SIZE :]
+        ):
+            raise SmokeFailure(
+                f"package slot {slot_index} has nonzero reserved header bytes"
+            )
+        stored_header_checksum = int.from_bytes(
+            header[
+                PACKAGE_HEADER_CHECKSUM_OFFSET : PACKAGE_HEADER_CHECKSUM_OFFSET + 2
+            ],
+            "little",
+        )
+        unchecked_header = bytearray(header)
+        unchecked_header[
+            PACKAGE_HEADER_CHECKSUM_OFFSET : PACKAGE_HEADER_CHECKSUM_OFFSET + 2
+        ] = b"\0\0"
+        if checksum16(unchecked_header) != stored_header_checksum:
+            raise SmokeFailure(
+                f"package slot {slot_index} header checksum is invalid"
+            )
+
+        filename_field = header[
+            PACKAGE_FILENAME_OFFSET : PACKAGE_FILENAME_OFFSET + PACKAGE_FILENAME_SIZE
+        ]
+        filename, separator, padding = filename_field.partition(b"\0")
+        try:
+            normalized = normalize_filename(filename)
+        except ValueError as error:
+            raise SmokeFailure(
+                f"package slot {slot_index} filename is invalid: {error}"
+            ) from error
+        if (
+            not separator
+            or padding.strip(b"\0")
+            or normalized != filename
+            or not filename.endswith(b".BAS")
+            or filename in names
+        ):
+            raise SmokeFailure(f"package slot {slot_index} filename is invalid")
+
+        source_length = int.from_bytes(
+            header[PACKAGE_LENGTH_OFFSET : PACKAGE_LENGTH_OFFSET + 2], "little"
+        )
+        if not 1 <= source_length <= DOCUMENT_MAX:
+            raise SmokeFailure(
+                f"package {filename.decode('ascii')} length is invalid"
+            )
+        source = payload[:source_length]
+        if (
+            b"\0" in source
+            or any(value > 0x7F for value in source)
+            or b"\n" in source.replace(b"\r\n", b"")
+            or b"\r" in source.replace(b"\r\n", b"")
+        ):
+            raise SmokeFailure(
+                f"package {filename.decode('ascii')} source is not canonical ASCII"
+            )
+        stored_source_checksum = int.from_bytes(
+            header[
+                PACKAGE_SOURCE_CHECKSUM_OFFSET : PACKAGE_SOURCE_CHECKSUM_OFFSET + 2
+            ],
+            "little",
+        )
+        if checksum16(source) != stored_source_checksum:
+            raise SmokeFailure(
+                f"package {filename.decode('ascii')} source checksum is invalid"
+            )
+        if any(payload[source_length:]):
+            raise SmokeFailure(
+                f"package {filename.decode('ascii')} payload padding is not blank"
+            )
+
+        names.add(filename)
+        packages.append(Package(slot_index, filename, source))
+
+    if not packages:
+        raise SmokeFailure("package catalog is empty")
+    return tuple(packages)
+
+
+def find_package(packages: tuple[Package, ...], filename: bytes) -> Package:
+    wanted = normalize_filename(filename)
+    for package in packages:
+        if package.filename == wanted:
+            return package
+    raise SmokeFailure(f"required package {wanted.decode('ascii')} is missing")
 
 
 def build_legacy_record(generation: int, document: bytes) -> bytes:
@@ -885,9 +1033,15 @@ def exercise_extended_basic(qemu: str, image: Path) -> None:
         raise SmokeFailure("extended unsaved BASIC checks changed the disk image")
 
 
-def exercise_corrupt_basic_module(qemu: str, image: Path) -> None:
-    original = image.read_bytes()
-    damaged = bytearray(original)
+def exercise_corrupt_basic_module(
+    qemu: str, image: Path, tetris_source: bytes
+) -> None:
+    damaged = bytearray(image.read_bytes())
+    install_snapshot(
+        damaged,
+        0,
+        build_snapshot(0, ((b"TETRIS.BAS", tetris_source),)),
+    )
     damaged[BASIC_MODULE_OFFSET + 128] ^= 0x5A
     image.write_bytes(damaged)
     damaged_before = image.read_bytes()
@@ -911,24 +1065,46 @@ def exercise_corrupt_basic_module(qemu: str, image: Path) -> None:
         raise SmokeFailure("corrupt BASIC-module refusal changed the disk image")
 
 
-def exercise_bundled_tetris(qemu: str, image: Path) -> None:
-    source = TETRIS_SOURCE.read_bytes()
-    if b"\r" in source or b"\0" in source or any(value > 0x7F for value in source):
-        raise SmokeFailure("tracked TETRIS.BAS is not normalizable ASCII source")
-    source = source.replace(b"\n", b"\r\n")
-    if len(source) > DOCUMENT_MAX:
-        raise SmokeFailure("normalized TETRIS.BAS exceeds the editor capacity")
-    original = image.read_bytes()
+def exercise_package_tetris(
+    qemu: str,
+    image: Path,
+    template: bytes,
+    packages: tuple[Package, ...],
+) -> None:
+    package = find_package(packages, b"TETRIS.BAS")
+    source = package.source
+    package_names = tuple(item.filename for item in packages)
 
     with QemuSession(qemu, image) as session:
         cursor = session.wait_for(b"nix> ", 0)
-        cursor = assert_files(session, (), cursor)
-        cursor = assert_editor_document(session, b"TETRIS.BAS", source, cursor)
+        cursor = assert_packages(session, package_names, cursor)
         cursor = assert_files(session, (), cursor)
 
-        session.write(b"run MISSING.BAS\r")
+        session.write(b"run TETRIS.BAS\r")
         cursor = session.wait_for(
-            b"run MISSING.BAS\r\nFile not found.\r\nnix> ", cursor
+            b"run TETRIS.BAS\r\nFile not found.\r\nnix> ", cursor
+        )
+
+        install_command = b"pkg install tEtRiS.bAs"
+        session.write(install_command + b"\r")
+        cursor = session.wait_for(
+            install_command + b"\r\nPackage installed.\r\nnix> ", cursor
+        )
+        cursor = assert_files(session, (package.filename,), cursor)
+
+        session.write(b"reboot\r")
+        cursor = session.wait_for(b"reboot\r\nRebooting...\r\n", cursor)
+        cursor = session.wait_for(
+            b"Nixodria OS\r\nType help.\r\nnix> ", cursor
+        )
+        cursor = assert_packages(session, package_names, cursor)
+        cursor = assert_files(session, (package.filename,), cursor)
+        cursor = assert_editor_document(
+            session,
+            package.filename,
+            source,
+            cursor,
+            entered_filename=b"tetris.bas",
         )
 
         session.write(b"run TETRIS.BAS\r")
@@ -1027,26 +1203,58 @@ def exercise_bundled_tetris(qemu: str, image: Path) -> None:
         cursor = session.wait_for(b"nix> ", cursor)
         session.write(b"echo OK\r")
         cursor = session.wait_for(b"echo OK\r\nOK\r\nnix> ", cursor)
-        cursor = assert_files(session, (), cursor)
+        cursor = assert_files(session, (package.filename,), cursor)
         halt(session, cursor)
 
-    if image.read_bytes() != original:
-        raise SmokeFailure("bundled Tetris gameplay changed the disk image")
+    assert_saved_snapshot(
+        image,
+        ((package.filename, source),),
+        template,
+        expected_slot=0,
+        expected_generation=0,
+    )
 
 
-def exercise_saved_tetris_override(
-    qemu: str, image: Path, template: bytes
+def exercise_package_lifecycle(
+    qemu: str,
+    image: Path,
+    template: bytes,
+    packages: tuple[Package, ...],
 ) -> None:
-    filename = b"TETRIS.BAS"
-    bundled = TETRIS_SOURCE.read_bytes().replace(b"\n", b"\r\n")
+    package = find_package(packages, b"HELLO.BAS")
+    filename = package.filename
+    source = package.source
     override = b'10 print "OVERRIDE"\r\n20 end'
+    package_names = tuple(item.filename for item in packages)
 
     with QemuSession(qemu, image) as session:
         cursor = session.wait_for(b"nix> ", 0)
+
+        session.write(b"pkg install MISSING.BAS\r")
+        cursor = session.wait_for(
+            b"pkg install MISSING.BAS\r\nPackage not found.\r\nnix> ", cursor
+        )
+        session.write(b"pkg remove missing.bas\r")
+        cursor = session.wait_for(
+            b"pkg remove missing.bas\r\nPackage is not installed.\r\nnix> ",
+            cursor,
+        )
+        session.write(b"pkg remove TETRIS.BAS\r")
+        cursor = session.wait_for(
+            b"pkg remove TETRIS.BAS\r\nPackage is not installed.\r\nnix> ",
+            cursor,
+        )
+
+        session.write(b"pkg install HELLO.BAS\r")
+        cursor = session.wait_for(
+            b"pkg install HELLO.BAS\r\nPackage installed.\r\nnix> ", cursor
+        )
+        cursor = assert_editor_document(session, filename, source, cursor)
+
         command = b"edit " + filename
         session.write(command + b"\r")
         cursor = session.wait_for(
-            command + b"\r\n" + editor_frame(filename) + bundled, cursor
+            command + b"\r\n" + editor_frame(filename) + source, cursor
         )
         session.write(b"\x0c")
         cursor = session.wait_for(editor_frame(filename), cursor)
@@ -1057,9 +1265,17 @@ def exercise_saved_tetris_override(
         session.write(b"\x18")
         cursor = session.wait_for(b"\r\nnix> ", cursor)
 
-        session.write(b"run TETRIS.BAS\r")
+        session.write(b"pkg install hElLo.BaS\r")
         cursor = session.wait_for(
-            b"run TETRIS.BAS\r\n"
+            b"pkg install hElLo.BaS\r\n"
+            b"Package already installed.\r\nnix> ",
+            cursor,
+        )
+        cursor = assert_editor_document(session, filename, override, cursor)
+
+        session.write(b"run HELLO.BAS\r")
+        cursor = session.wait_for(
+            b"run HELLO.BAS\r\n"
             + BASIC_FRAME
             + b"OVERRIDE\r\n"
             + BASIC_FINISHED,
@@ -1068,15 +1284,387 @@ def exercise_saved_tetris_override(
         session.write(b" ")
         cursor = session.wait_for(b"nix> ", cursor)
         cursor = assert_editor_document(session, filename, override, cursor)
+
+        session.write(b"pkg remove hello.bas\r")
+        cursor = session.wait_for(
+            b"pkg remove hello.bas\r\nPackage removed.\r\nnix> ", cursor
+        )
+        cursor = assert_files(session, (), cursor)
+        session.write(b"pkg remove HELLO.BAS\r")
+        cursor = session.wait_for(
+            b"pkg remove HELLO.BAS\r\nPackage is not installed.\r\nnix> ",
+            cursor,
+        )
+
+        session.write(b"reboot\r")
+        cursor = session.wait_for(b"reboot\r\nRebooting...\r\n", cursor)
+        cursor = session.wait_for(
+            b"Nixodria OS\r\nType help.\r\nnix> ", cursor
+        )
+        cursor = assert_packages(session, package_names, cursor)
+        cursor = assert_files(session, (), cursor)
+        session.write(b"run HELLO.BAS\r")
+        cursor = session.wait_for(
+            b"run HELLO.BAS\r\nFile not found.\r\nnix> ", cursor
+        )
         halt(session, cursor)
 
     assert_saved_snapshot(
         image,
-        ((filename, override),),
+        (),
         template,
         expected_slot=0,
-        expected_generation=0,
+        expected_generation=2,
     )
+
+    retired_template = bytearray(template)
+    retired_slot = PACKAGE_CATALOG_OFFSET + package.slot * PACKAGE_SLOT_SIZE
+    retired_template[retired_slot : retired_slot + PACKAGE_SLOT_SIZE] = bytes(
+        PACKAGE_SLOT_SIZE
+    )
+    install_snapshot(
+        retired_template,
+        0,
+        build_snapshot(4, ((filename, source),)),
+    )
+    retired_image = image.with_name("retired-package-removal.img")
+    retired_image.write_bytes(retired_template)
+    with QemuSession(qemu, retired_image) as session:
+        cursor = session.wait_for(b"nix> ", 0)
+        cursor = assert_packages(session, (b"TETRIS.BAS",), cursor)
+        cursor = assert_files(session, (filename,), cursor)
+        session.write(b"pkg remove HELLO.BAS\r")
+        cursor = session.wait_for(
+            b"pkg remove HELLO.BAS\r\nPackage removed.\r\nnix> ", cursor
+        )
+        cursor = assert_files(session, (), cursor)
+        halt(session, cursor)
+    assert_saved_snapshot(
+        retired_image,
+        (),
+        bytes(retired_template),
+        expected_slot=1,
+        expected_generation=5,
+    )
+
+
+def exercise_package_compaction(
+    qemu: str,
+    image: Path,
+    template: bytes,
+    packages: tuple[Package, ...],
+) -> None:
+    tetris = find_package(packages, b"TETRIS.BAS")
+    hello = find_package(packages, b"HELLO.BAS")
+    notes_name = b"NOTES.TXT"
+    notes = b"kept after package removal"
+
+    with QemuSession(qemu, image) as session:
+        cursor = session.wait_for(b"nix> ", 0)
+        for package in (tetris, hello):
+            command = b"pkg install " + package.filename
+            session.write(command + b"\r")
+            cursor = session.wait_for(
+                command + b"\r\nPackage installed.\r\nnix> ", cursor
+            )
+
+        command = b"edit " + notes_name
+        session.write(command + b"\r")
+        cursor = session.wait_for(
+            command + b"\r\n" + editor_frame(notes_name), cursor
+        )
+        session.write(notes + b"\x13")
+        cursor = session.wait_for(
+            notes + editor_frame(notes_name, b"Saved.") + notes, cursor
+        )
+        session.write(b"\x18")
+        cursor = session.wait_for(b"\r\nnix> ", cursor)
+        cursor = assert_files(
+            session, (tetris.filename, hello.filename, notes_name), cursor
+        )
+
+        session.write(b"pkg remove HELLO.BAS\r")
+        cursor = session.wait_for(
+            b"pkg remove HELLO.BAS\r\nPackage removed.\r\nnix> ", cursor
+        )
+        expected_names = (tetris.filename, notes_name)
+        cursor = assert_files(session, expected_names, cursor)
+        cursor = assert_editor_document(
+            session, tetris.filename, tetris.source, cursor
+        )
+        cursor = assert_editor_document(session, notes_name, notes, cursor)
+
+        session.write(b"reboot\r")
+        cursor = session.wait_for(b"reboot\r\nRebooting...\r\n", cursor)
+        cursor = session.wait_for(
+            b"Nixodria OS\r\nType help.\r\nnix> ", cursor
+        )
+        cursor = assert_files(session, expected_names, cursor)
+        cursor = assert_editor_document(
+            session, tetris.filename, tetris.source, cursor
+        )
+        cursor = assert_editor_document(session, notes_name, notes, cursor)
+        halt(session, cursor)
+
+    assert_saved_snapshot(
+        image,
+        ((tetris.filename, tetris.source), (notes_name, notes)),
+        template,
+        expected_slot=1,
+        expected_generation=3,
+    )
+
+
+def exercise_corrupt_package_catalog(
+    qemu: str,
+    template: bytes,
+    directory: Path,
+    packages: tuple[Package, ...],
+) -> None:
+    package = find_package(packages, b"TETRIS.BAS")
+    package_names = tuple(item.filename for item in packages)
+    slot_offset = PACKAGE_CATALOG_OFFSET + package.slot * PACKAGE_SLOT_SIZE
+
+    zeroed_header = bytearray(template)
+    zeroed_header[slot_offset : slot_offset + SECTOR_SIZE] = bytes(SECTOR_SIZE)
+    zeroed_header_image = directory / "zeroed-package-header.img"
+    zeroed_header_image.write_bytes(zeroed_header)
+    zeroed_header_before = zeroed_header_image.read_bytes()
+    with QemuSession(qemu, zeroed_header_image) as session:
+        cursor = session.wait_for(b"nix> ", 0)
+        session.write(b"pkg list\r")
+        cursor = session.wait_for(
+            b"pkg list\r\nPackage catalog unavailable.\r\nnix> ", cursor
+        )
+        session.write(b"pkg install TETRIS.BAS\r")
+        cursor = session.wait_for(
+            b"pkg install TETRIS.BAS\r\n"
+            b"Package catalog unavailable.\r\nnix> ",
+            cursor,
+        )
+        cursor = assert_files(session, (), cursor)
+        halt(session, cursor)
+    if zeroed_header_image.read_bytes() != zeroed_header_before:
+        raise SmokeFailure("zeroed package-header refusal changed the disk image")
+
+    blank_slot = bytearray(template)
+    blank_slot[slot_offset : slot_offset + PACKAGE_SLOT_SIZE] = bytes(
+        PACKAGE_SLOT_SIZE
+    )
+    blank_slot_image = directory / "blank-package-slot-hole.img"
+    blank_slot_image.write_bytes(blank_slot)
+    blank_slot_before = blank_slot_image.read_bytes()
+    with QemuSession(qemu, blank_slot_image) as session:
+        cursor = session.wait_for(b"nix> ", 0)
+        session.write(b"pkg list\r")
+        cursor = session.wait_for(
+            b"pkg list\r\nPackage catalog unavailable.\r\nnix> ", cursor
+        )
+        session.write(b"pkg install HELLO.BAS\r")
+        cursor = session.wait_for(
+            b"pkg install HELLO.BAS\r\n"
+            b"Package catalog unavailable.\r\nnix> ",
+            cursor,
+        )
+        cursor = assert_files(session, (), cursor)
+        halt(session, cursor)
+    if blank_slot_image.read_bytes() != blank_slot_before:
+        raise SmokeFailure("package-slot hole refusal changed the disk image")
+
+    bad_header = bytearray(template)
+    bad_header[slot_offset + PACKAGE_HEADER_CHECKSUM_OFFSET] ^= 0x01
+    header_image = directory / "corrupt-package-header.img"
+    header_image.write_bytes(bad_header)
+    header_before = header_image.read_bytes()
+    with QemuSession(qemu, header_image) as session:
+        cursor = session.wait_for(b"nix> ", 0)
+        session.write(b"pkg list\r")
+        cursor = session.wait_for(
+            b"pkg list\r\nPackage catalog unavailable.\r\nnix> ", cursor
+        )
+        session.write(b"pkg install TETRIS.BAS\r")
+        cursor = session.wait_for(
+            b"pkg install TETRIS.BAS\r\n"
+            b"Package catalog unavailable.\r\nnix> ",
+            cursor,
+        )
+        cursor = assert_files(session, (), cursor)
+        halt(session, cursor)
+    if header_image.read_bytes() != header_before:
+        raise SmokeFailure("corrupt package-header refusal changed the disk image")
+
+    bad_payload = bytearray(template)
+    bad_payload[slot_offset + SECTOR_SIZE] ^= 0x01
+    payload_image = directory / "corrupt-package-payload.img"
+    payload_image.write_bytes(bad_payload)
+    payload_before = payload_image.read_bytes()
+    with QemuSession(qemu, payload_image) as session:
+        cursor = session.wait_for(b"nix> ", 0)
+        cursor = assert_packages(session, package_names, cursor)
+        session.write(b"pkg install TETRIS.BAS\r")
+        cursor = session.wait_for(
+            b"pkg install TETRIS.BAS\r\nPackage install failed.\r\nnix> ",
+            cursor,
+        )
+        cursor = assert_files(session, (), cursor)
+        session.write(b"run TETRIS.BAS\r")
+        cursor = session.wait_for(
+            b"run TETRIS.BAS\r\nFile not found.\r\nnix> ", cursor
+        )
+        halt(session, cursor)
+    if payload_image.read_bytes() != payload_before:
+        raise SmokeFailure("corrupt package-payload refusal changed the disk image")
+
+
+def exercise_package_write_failures(
+    qemu: str,
+    template: bytes,
+    directory: Path,
+    packages: tuple[Package, ...],
+) -> None:
+    package = find_package(packages, b"HELLO.BAS")
+
+    install_image = directory / "readonly-package-install.img"
+    install_image.write_bytes(template)
+    before_install = install_image.read_bytes()
+    with QemuSession(qemu, install_image, readonly=True) as session:
+        cursor = session.wait_for(b"nix> ", 0)
+        session.write(b"pkg install HELLO.BAS\r")
+        cursor = session.wait_for(
+            b"pkg install HELLO.BAS\r\nPackage install failed.\r\nnix> ",
+            cursor,
+        )
+        cursor = assert_files(session, (), cursor)
+        halt(session, cursor)
+    if install_image.read_bytes() != before_install:
+        raise SmokeFailure("failed package install changed a read-only image")
+    assert_files_on_boot(qemu, install_image, ())
+
+    installed = bytearray(template)
+    install_snapshot(
+        installed,
+        0,
+        build_snapshot(4, ((package.filename, package.source),)),
+    )
+    remove_image = directory / "readonly-package-remove.img"
+    remove_image.write_bytes(installed)
+    before_remove = remove_image.read_bytes()
+    expected = ((package.filename, package.source),)
+    with QemuSession(qemu, remove_image, readonly=True) as session:
+        cursor = session.wait_for(b"nix> ", 0)
+        session.write(b"pkg remove hello.bas\r")
+        cursor = session.wait_for(
+            b"pkg remove hello.bas\r\nPackage remove failed.\r\nnix> ",
+            cursor,
+        )
+        cursor = assert_files(session, (package.filename,), cursor)
+        cursor = assert_editor_document(
+            session, package.filename, package.source, cursor
+        )
+        halt(session, cursor)
+    if remove_image.read_bytes() != before_remove:
+        raise SmokeFailure("failed package removal changed a read-only image")
+    assert_files_on_boot(qemu, remove_image, expected)
+
+    keep_name = b"KEEP.TXT"
+    keep_document = b"preserved beside failed package removal"
+    rollback_files = (
+        (package.filename, package.source),
+        (keep_name, keep_document),
+    )
+    rollback_data = bytearray(template)
+    install_snapshot(rollback_data, 0, build_snapshot(4, rollback_files))
+    rollback_image = directory / "fault-package-remove-rollback.img"
+    rollback_image.write_bytes(rollback_data)
+    rollback_config = directory / "fault-package-remove-rollback.conf"
+
+    # The first write invalidates snapshot B and advances blkdebug to state 2.
+    # Three one-shot rules then fail every BIOS retry of the final header write.
+    # Snapshot reads remain faulted in that state, so disk-based rollback loses
+    # the live directory while an in-memory rollback can continue safely.
+    state_rule = """
+[set-state]
+event = "write_aio"
+state = "1"
+new_state = "2"
+"""
+    write_failure_rule = f"""
+[inject-error]
+event = "write_aio"
+state = "2"
+errno = "5"
+sector = "{SNAPSHOT_LBAS[1]}"
+once = "on"
+iotype = "write"
+"""
+    read_failure_rules = tuple(
+        f"""
+[inject-error]
+event = "read_aio"
+state = "2"
+errno = "5"
+sector = "{sector}"
+iotype = "read"
+"""
+        for sector in SNAPSHOT_LBAS
+    )
+    rollback_config.write_text(
+        "\n\n".join(
+            rule.strip()
+            for rule in (
+                state_rule,
+                write_failure_rule,
+                write_failure_rule,
+                write_failure_rule,
+                *read_failure_rules,
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    after_name = b"AFTER.TXT"
+    after_document = b"saved after failed package removal"
+    with QemuSession(qemu, rollback_image, blkdebug_config=rollback_config) as session:
+        cursor = session.wait_for(b"nix> ", 0)
+        session.write(b"pkg remove HELLO.BAS\r")
+        cursor = session.wait_for(
+            b"pkg remove HELLO.BAS\r\nPackage remove failed.\r\nnix> ",
+            cursor,
+            timeout=10.0,
+        )
+        cursor = assert_files(
+            session, tuple(filename for filename, _ in rollback_files), cursor
+        )
+        for filename, document in rollback_files:
+            cursor = assert_editor_document(session, filename, document, cursor)
+
+        command = b"edit " + after_name
+        session.write(command + b"\r")
+        cursor = session.wait_for(
+            command + b"\r\n" + editor_frame(after_name), cursor
+        )
+        session.write(after_document + b"\x13")
+        cursor = session.wait_for(
+            after_document
+            + editor_frame(after_name, b"Saved.")
+            + after_document,
+            cursor,
+            timeout=10.0,
+        )
+        session.write(b"\x18")
+        cursor = session.wait_for(b"\r\nnix> ", cursor)
+        halt(session, cursor)
+
+    after_files = rollback_files + ((after_name, after_document),)
+    assert_saved_snapshot(
+        rollback_image,
+        after_files,
+        template,
+        expected_slot=1,
+        expected_generation=5,
+    )
+    assert_files_on_boot(qemu, rollback_image, after_files)
 
 
 def exercise_filename_rules(qemu: str, image: Path) -> None:
@@ -1086,8 +1674,8 @@ def exercise_filename_rules(qemu: str, image: Path) -> None:
         cursor = session.wait_for(
             b"help\r\n"
             b"help files edit [filename] run <filename>\r\n"
+            b"pkg list pkg install <filename> pkg remove <filename>\r\n"
             b"print <filename> printer [IPv4] clear echo <text> reboot halt\r\n"
-            b"Try: run TETRIS.BAS\r\n"
             b"nix> ",
             cursor,
         )
@@ -1131,6 +1719,12 @@ def exercise_filename_rules(qemu: str, image: Path) -> None:
             cursor = session.wait_for(
                 command + b"\r\nInvalid filename.\r\nnix> ", cursor
             )
+            for prefix in (b"pkg install ", b"pkg remove "):
+                command = prefix + invalid
+                session.write(command + b"\r")
+                cursor = session.wait_for(
+                    command + b"\r\nInvalid filename.\r\nnix> ", cursor
+                )
 
         valid = b"a_b-c.d12345"
         command = b"edit " + valid
@@ -1657,6 +2251,13 @@ def exercise_storage_full(
         cursor = assert_files(
             session, tuple(filename for filename, _ in files), cursor
         )
+        session.write(b"pkg install TETRIS.BAS\r")
+        cursor = session.wait_for(
+            b"pkg install TETRIS.BAS\r\nStorage full.\r\nnix> ", cursor
+        )
+        cursor = assert_files(
+            session, tuple(filename for filename, _ in files), cursor
+        )
         filename = b"NINTH.BAS"
         command = b"edit ninth.bas"
         session.write(command + b"\r")
@@ -1728,6 +2329,9 @@ def main() -> int:
             raise SmokeFailure(
                 f"source image is {len(source_before)} bytes; expected {IMAGE_SIZE}"
             )
+        packages = extract_packages(source_before)
+        tetris_package = find_package(packages, b"TETRIS.BAS")
+        find_package(packages, b"HELLO.BAS")
         with tempfile.TemporaryDirectory(prefix="nixodria-smoke-") as directory:
             root = Path(directory)
 
@@ -1741,17 +2345,34 @@ def main() -> int:
 
             tetris_image = root / "tetris.img"
             shutil.copyfile(source_image, tetris_image)
-            exercise_bundled_tetris(qemu, tetris_image)
+            exercise_package_tetris(
+                qemu, tetris_image, source_before, packages
+            )
 
-            tetris_override_image = root / "tetris-override.img"
-            shutil.copyfile(source_image, tetris_override_image)
-            exercise_saved_tetris_override(
-                qemu, tetris_override_image, source_before
+            package_lifecycle_image = root / "package-lifecycle.img"
+            shutil.copyfile(source_image, package_lifecycle_image)
+            exercise_package_lifecycle(
+                qemu, package_lifecycle_image, source_before, packages
+            )
+
+            package_compaction_image = root / "package-compaction.img"
+            shutil.copyfile(source_image, package_compaction_image)
+            exercise_package_compaction(
+                qemu, package_compaction_image, source_before, packages
+            )
+
+            exercise_corrupt_package_catalog(
+                qemu, source_before, root, packages
+            )
+            exercise_package_write_failures(
+                qemu, source_before, root, packages
             )
 
             corrupt_basic_image = root / "corrupt-basic.img"
             shutil.copyfile(source_image, corrupt_basic_image)
-            exercise_corrupt_basic_module(qemu, corrupt_basic_image)
+            exercise_corrupt_basic_module(
+                qemu, corrupt_basic_image, tetris_package.source
+            )
 
             filename_image = root / "filenames.img"
             shutil.copyfile(source_image, filename_image)
@@ -1845,8 +2466,8 @@ def main() -> int:
         return 1
 
     print(
-        "smoke: named files, extended BASIC, Tetris, persistence, recovery, "
-        "and write faults passed"
+        "smoke: package install/remove, editable Tetris, named files, extended "
+        "BASIC, persistence, recovery, corruption refusal, and write faults passed"
     )
     return 0
 

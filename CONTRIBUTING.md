@@ -23,7 +23,10 @@ proposal when their scope and expected behavior are clear.
 Every application contributed for inclusion in Nixodria OS must be written and
 shared as editable source code in Nixodria's built-in flavor of BASIC. This
 includes calculators, games, utilities, and every other user-facing program
-intended to run within the OS.
+intended to run within the OS. Application source and catalog metadata belong
+in the public
+[`Nixodria/Nixodria-Packages`](https://github.com/Nixodria/Nixodria-Packages)
+repository; this repository pins a reviewed package-catalog release.
 
 This rule applies equally to everyone. The founder, maintainers, members of the
 Nixodria organization, established contributors, and first-time newcomers all
@@ -52,10 +55,30 @@ application itself as native assembly or in another language.
 
 Contributors must also share every change they make to Nixodria BASIC itself.
 This includes changes to its syntax, language behavior, built-ins, interpreter,
-or runtime support. Include those changes in the application's pull request or
-in a linked prerequisite pull request that lands first, together with relevant
-documentation and tests. An application must not depend on a private or
-unpublished variant of Nixodria BASIC.
+or runtime support. Publish those changes here in a linked prerequisite or
+coordinated pull request, together with relevant documentation and tests. Land
+and release the interpreter support before updating the package catalog pin. An
+application must not depend on a private or unpublished variant of Nixodria
+BASIC.
+
+### Package governance
+
+The Nixodria project owner retains the right to create, revise, replace, and
+enforce the rules governing packages distributed through the official OS
+package manager. This authority includes package eligibility, source and file
+formats, technical compatibility, safety and quality requirements, review,
+versioning, installation behavior, deprecation, and removal from the official
+catalog. These examples do not limit that authority; the owner may establish
+other package rules as the project evolves.
+
+Package rules may evolve as Nixodria OS evolves. A change becomes an official
+project rule when it is published in the Nixodria OS or Nixodria Packages
+repository and, when necessary, reflected in the package-manager implementation
+or catalog. Until a published rule is changed, it applies to every official
+package submission and maintainer action, including those made by the project
+owner. Forks may adopt different rules but may not present their catalogs as the
+official Nixodria package catalog. Submission or past inclusion does not
+guarantee acceptance or continued distribution in the official catalog.
 
 ## Development environment
 
@@ -97,8 +120,10 @@ include the relevant version output in your issue or pull request.
   general-purpose interactive runtime support.
 - `src/print.asm` contains the demand-loaded NE2000, TCP/IP, IPP, and raster
   printing module.
-- `apps/TETRIS.BAS` contains the complete editable Tetris application source.
-- `tools/build_image.py` installs both modules and the bundled BASIC source
+- `packages.lock.json` pins the public package-catalog release and SHA-256.
+- `tools/fetch_package_catalog.py` downloads and verifies that exact release
+  artifact into the ignored local cache.
+- `tools/build_image.py` installs both modules and the verified package catalog
   after the file snapshots.
 - `tools/prepare_runtime_image.py` creates or safely refreshes the writable
   runtime image while preserving its file snapshots.
@@ -112,6 +137,7 @@ include the relevant version output in your issue or pull request.
 - `build/nixodria.img` is the reproducible blank build output.
 - `.nixodria/nixodria.img` is the local writable runtime image and can contain a
   user's saved files.
+- `.nixodria/nixodria-packages.bin` is the verified package-catalog cache.
 
 `build/`, `.nixodria/`, and Python cache directories are generated locally and
 must not be committed.
@@ -122,12 +148,12 @@ must not be committed.
 
 The current image is a standard 1.44 MiB floppy: one 512-byte BIOS boot sector,
 a ten-sector resident kernel, two 33-sector file snapshots, a 32-sector native
-printer-module slot, a 16-sector BASIC-module slot, and a five-sector bundled
-application slot. The application slot contains one checked header sector and
-four source sectors. Each writable snapshot contains one directory sector and
-eight fixed four-sector file slots. The first sector must retain its `55 aa`
-BIOS signature, a freshly built image must have blank snapshots, and sectors
-after the bundled-application slot must remain blank.
+printer-module slot, a 16-sector BASIC-module slot, and eight five-sector
+package slots. Each package slot contains one checked header sector and four
+source sectors. Each writable snapshot contains one directory sector and eight
+fixed four-sector file slots. The first sector must retain its `55 aa` BIOS
+signature, a freshly built image must have blank snapshots, and sectors after
+the package catalog must remain blank.
 
 If a change intentionally alters the image layout, update every affected
 constant and assumption together in:
@@ -151,10 +177,9 @@ make a larger image build.
 ### Protect persistent data
 
 Normal rebuilds replace the runtime image's immutable boot, kernel, printer and
-BASIC modules, bundled application source, and unused sectors. They must not
-overwrite either file snapshot.
-`make clean` intentionally removes
-`build/` but leaves `.nixodria/nixodria.img` intact.
+BASIC modules, package catalog, and unused sectors. They must not overwrite
+either file snapshot. `make clean` intentionally removes `build/` but leaves
+the runtime image and verified package-catalog cache under `.nixodria/` intact.
 
 Changes to runtime-image handling or editor saves must remain fail-closed:
 malformed images and symbolic links must not be overwritten, runtime files must
@@ -183,9 +208,9 @@ The repository provides these validation targets:
 - `make` assembles `build/nixodria.img` with NASM warnings treated as errors.
 - `make check` validates the image layout and runtime-image preparation logic.
 - `make smoke` runs `make check`, then exercises the shell, editor, BASIC
-  interpreter and interactive runtime, bundled Tetris game, persistence,
-  recovery, write-failure behavior, and a complete native print submission to
-  a local fake IPP printer in QEMU.
+  interpreter and interactive runtime, package listing/install/removal, Tetris,
+  persistence, recovery, write-failure behavior, and a complete native print
+  submission to a local fake IPP printer in QEMU.
 - `make run` starts an interactive session on the headless COM1 serial console.
   Press Control-C to stop QEMU.
 
@@ -236,7 +261,8 @@ Before submitting, confirm that:
 - [ ] Every new application is implemented in Nixodria BASIC; only the existing
       pre-BASIC text editor and genuine enhancements to it are exempt.
 - [ ] The complete application source and every required Nixodria BASIC change
-      are included in this pull request or a linked prerequisite pull request.
+      are published in coordinated package and OS pull requests, with OS runtime
+      support released before the package catalog depends on it.
 - [ ] Image, memory, and persistent-storage invariants still hold.
 - [ ] Applicable automated tests pass.
 - [ ] `git diff --check` reports no whitespace errors.
