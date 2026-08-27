@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Refresh immutable OS/app regions and preserve Nixodria's file snapshots."""
+"""Refresh immutable OS/package regions and preserve saved file snapshots."""
 
 import os
 from pathlib import Path

@@ -7,7 +7,8 @@ BASIC files in two alternating recovery snapshots. The kernel starts a serial
 console without processes or a general-purpose filesystem. A demand-loaded
 module provides the BASIC interpreter, while another supplies the small network
 stack and rasterizer used for direct IPP printing. The image also bundles an
-editable Tetris program written entirely in Nixodria BASIC.
+integrity-checked catalog of editable BASIC packages published from the
+[Nixodria Packages](https://github.com/Nixodria/Nixodria-Packages) repository.
 
 ## Commands
 
@@ -15,7 +16,10 @@ editable Tetris program written entirely in Nixodria BASIC.
 - `files` — list saved files by name
 - `edit <filename>` — open an existing file or start a new one
 - `edit` — open `UNTITLED.TXT` for compatibility
-- `run <filename>` — run a saved or bundled BASIC source file
+- `run <filename>` — run a saved BASIC source file
+- `pkg list` — list packages available in the embedded catalog
+- `pkg install <filename>` — install a package as an editable saved file
+- `pkg remove <filename>` — remove a saved file installed under that name
 - `print <filename>` — rasterize and queue a saved file on the configured printer
 - `printer` — show the configured printer IPv4 address
 - `printer <IPv4>` — set the printer address for the current boot
@@ -56,11 +60,52 @@ does not save implicitly. Program output is shown on the serial console, and a
 syntax or runtime error stops the program and returns safely to the editor
 without changing its source.
 
-## Tetris
+## Packages
 
-Start the bundled game directly from the shell:
+The package catalog is a pinned, reproducible snapshot of
+[`Nixodria/Nixodria-Packages`](https://github.com/Nixodria/Nixodria-Packages).
+Every package is complete Nixodria BASIC source; the catalog contains no opaque
+application binaries. List and install the initial packages from the shell:
 
 ```text
+pkg list
+pkg install HELLO.BAS
+run HELLO.BAS
+```
+
+An installed package occupies one of the same eight durable file slots used by
+the editor. It appears under `files`, remains editable with `edit <filename>`,
+and persists across reboot. Installation refuses to overwrite a saved file of
+the same name, protecting local edits. To replace it with the catalog copy,
+explicitly run `pkg remove <filename>` and then install it again. Removal
+removes that saved source from the active directory after committing a new
+recoverable snapshot. Because installed source remains an ordinary editable
+file, removal works by saved filename even if that package is no longer in the
+current catalog; use it carefully, because the OS does not retain separate
+package-provenance metadata.
+
+The package catalog is immutable while the OS is running. Its headers, source
+lengths, filenames, and source payloads are protected by CRC-16 checks, and the
+host build verifies the entire pinned release artifact with SHA-256 before
+placing it in the floppy image. Nixodria's real-mode network stack does not
+claim to download from GitHub directly: it has no DNS or TLS implementation.
+
+The Nixodria project owner retains the right to define, change, and enforce the
+rules for packages distributed through the official OS package manager. Those
+rules may cover eligibility, source and format requirements, compatibility,
+safety, quality, review, versioning, or removal. Official changes are published
+in the Nixodria OS and Packages repositories so the active rules remain visible
+to users and contributors. The examples above do not limit that authority; the
+owner may establish other package rules as the project evolves. Until a
+published rule changes, it applies to every official package submission and
+maintainer action, including those made by the project owner.
+
+## Tetris
+
+Install and start the Tetris package:
+
+```text
+pkg install TETRIS.BAS
 run TETRIS.BAS
 ```
 
@@ -75,10 +120,10 @@ status below it shows the score (`S`) and cleared-line count (`L`). Controls are
 - `r` — restart after game over
 
 All tetromino rules, collision checks, line compaction, scoring, and game state
-live in [`apps/TETRIS.BAS`](apps/TETRIS.BAS), not native assembly. Run
-`edit TETRIS.BAS` to inspect or change the bundled source. If no saved file has
-that name, the editor loads the bundled copy; Control-S creates a normal
-persistent user override, which subsequent `edit` and `run` commands prefer.
+live in the editable
+[`packages/TETRIS.BAS`](https://github.com/Nixodria/Nixodria-Packages/blob/v1.0.1/packages/TETRIS.BAS)
+source, not native assembly. Run `edit TETRIS.BAS` after installation to inspect
+or change it.
 
 ## BASIC
 
@@ -127,8 +172,10 @@ For example:
 ```
 
 Each BASIC file can contain a program of at most 2,047 bytes. The flat file
-store does not provide rename or delete operations. This BASIC subset does not
-provide string variables, `FOR`/`NEXT`, functions, or more than one array.
+store does not provide rename or a separate general-purpose delete command;
+`pkg remove <filename>` explicitly deletes the matching saved file.
+This BASIC subset does not provide string variables, `FOR`/`NEXT`, functions,
+or more than one array.
 
 ## Native printing
 
@@ -162,11 +209,23 @@ NASM, Python 3, GNU Make, and QEMU are required. On macOS with Homebrew:
 brew install nasm qemu
 ```
 
-Build the bootable image:
+Build the bootable image. The first build downloads the catalog pinned in
+`packages.lock.json`, verifies its size and SHA-256 digest, and caches it under
+`.nixodria/`:
 
 ```sh
 make
 ```
+
+For an offline or package-development build, provide an already verified or
+locally built catalog explicitly:
+
+```sh
+make PACKAGE_CATALOG=/path/to/nixodria-packages.bin
+```
+
+The override still receives structural and CRC validation, but it bypasses the
+release SHA-256 pin; use it only with a catalog you trust.
 
 Check its exact image layout and BIOS signature, then boot it in QEMU and
 exercise the command loop and editor:
@@ -189,12 +248,16 @@ printer on the host's LAN.
 
 The reproducible blank-snapshot image is `build/nixodria.img`. `make run` boots
 the gitignored `.nixodria/nixodria.img` runtime copy. Normal rebuilds refresh
-only its boot, kernel, BASIC and print modules, bundled application source, and
-unused sectors while preserving every saved file; `make clean` also leaves this
-runtime copy intact. When an older
+only its boot, kernel, BASIC and print modules, package catalog, and unused
+sectors while preserving every saved file; `make clean` leaves both the runtime
+copy and verified package-catalog cache intact. When an older
 single-document runtime image is first refreshed, its last valid save
 immediately appears as `UNTITLED.TXT`; the next save converts the disk record to
-the named-file format.
+the named-file format. Existing named files, including a saved or edited
+`TETRIS.BAS`, survive the refresh unchanged. The former immutable bundled
+Tetris source is now supplied by the catalog, so users who never saved a local
+copy install it once with `pkg install TETRIS.BAS` after booting the refreshed
+image.
 
 ### Run inside Nixodria for Android
 
