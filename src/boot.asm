@@ -2,6 +2,7 @@ bits 16
 org 0x7c00
 
 COM1            equ 0x3f8
+ESCAPE_KEY      equ 27
 SHELL_BUFFER    equ 0x0600
 SHELL_CAPACITY  equ 32
 STORAGE_HEADER_A equ 0x9400
@@ -410,11 +411,16 @@ command_edit_name:
 
 .run:
     call basic_run
+    jc .package_exit
     call editor_redraw
     ; If Enter dismissed the output screen, ignore a following LF without
     ; changing the document. Any other key clears this state normally.
     mov bp, 1
     jmp .read
+
+.package_exit:
+    mov bx, cx
+    jmp shell
 
 .full:
     mov al, 7
@@ -1881,6 +1887,15 @@ basic_run:
     mov si, basic_module_error
     call print_string
     call serial_read
+    cmp al, ESCAPE_KEY
+    je .escaped
+    clc
+    jmp .restore
+.escaped:
+    call serial_discard_input
+    mov si, newline
+    call print_string
+    stc
 .restore:
     pop bp
     pop di
@@ -1964,6 +1979,49 @@ serial_read:
     jz .wait
     mov dx, COM1
     in al, dx
+    ret
+
+; Consume the remainder of the terminal key sequence that began with Escape.
+; Two tick transitions guarantee one complete BIOS tick for its ANSI suffix.
+serial_discard_input:
+    push ax
+    push bx
+    push cx
+    push dx
+    push bp
+    mov ah, 0
+    int 0x1a
+    mov bx, dx
+    mov bp, 2
+.next:
+    mov dx, COM1 + 5
+    in al, dx
+    test al, 1
+    jz .tick
+    mov dx, COM1
+    in al, dx
+.tick:
+    mov ah, 0
+    int 0x1a
+    cmp dx, bx
+    je .next
+    mov bx, dx
+    dec bp
+    jnz .next
+.drain_ready:
+    mov dx, COM1 + 5
+    in al, dx
+    test al, 1
+    jz .done
+    mov dx, COM1
+    in al, dx
+    jmp .drain_ready
+.done:
+    pop bp
+    pop dx
+    pop cx
+    pop bx
+    pop ax
     ret
 
 banner         db 27, '[2J', 27, '[H', 'Nixodria OS', 13, 10, 'Type help.', 13, 10, 0

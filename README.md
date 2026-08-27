@@ -28,7 +28,10 @@ integrity-checked catalog of editable BASIC packages published from the
 - `reboot` — restart the OS through the BIOS
 - `halt` — stop the CPU
 
-The shell input line holds 31 characters and supports Backspace.
+The shell input line holds 31 characters and supports Backspace. While a BASIC
+program or installed package is running, Escape stops it and returns directly
+to the `nix>` terminal. Escape is reserved by the runtime and is not delivered
+to the program through `KEY`.
 
 ## Text editor
 
@@ -56,9 +59,10 @@ writes and a full eight-file directory are reported instead of being presented
 as successful saves.
 
 Control-R runs the document currently in memory, including unsaved edits; it
-does not save implicitly. Program output is shown on the serial console, and a
-syntax or runtime error stops the program and returns safely to the editor
-without changing its source.
+does not save implicitly. Program output is shown on the serial console. A
+syntax or runtime error stops the program; an ordinary dismissal key returns
+safely to the editor, while Escape returns to the shell. Neither path changes
+the source.
 
 ## Packages
 
@@ -118,6 +122,7 @@ status below it shows the score (`S`) and cleared-line count (`L`). Controls are
 - Space — hard drop
 - `q` — end the game; press any key at the BASIC completion prompt to return
 - `r` — restart after game over
+- Escape — stop the package and return to the `nix>` terminal
 
 All tetromino rules, collision checks, line compaction, scoring, and game state
 live in the editable
@@ -139,7 +144,8 @@ subset. Every physical line starts with a decimal line number from 0 through
 - `GOTO line`
 - `GOSUB line` and `RETURN`, with at most 16 nested calls
 - `CLS` to clear the serial terminal
-- `KEY A` to store one pending input byte in `A`, or zero when none is ready
+- `KEY A` to store one pending input byte in `A`, or zero when none is ready;
+  Escape is reserved for returning to the OS terminal
 - `WAIT expression` to pause for a positive number of BIOS timer ticks
 - `TIMER A` to store the low 16 bits of the BIOS tick counter in `A`
 - `REM` followed by a comment

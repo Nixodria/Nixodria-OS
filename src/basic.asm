@@ -8,6 +8,7 @@ org 0x1000
 ;   SI -> NUL-terminated BASIC source, CX = source length (0..2047)
 ; Return:
 ;   BP, SP, DS, and ES are preserved. Other registers are caller-clobbered.
+;   Carry is set only when Escape stopped the program.
 ;
 ; The language has 26 signed-word scalar variables and one DIM-declared
 ; signed-word array with an inclusive maximum index from 0 through 255. The
@@ -36,6 +37,8 @@ EXPRESSION_DEPTH_LIMIT  equ 16
 WATCHDOG_RELOAD         equ 10001
 TICKS_PER_DAY_LOW       equ 0x00b0
 TICKS_PER_DAY_HIGH      equ 0x0018
+ESCAPE_KEY              equ 27
+KEY_QUEUE_CAPACITY      equ 16
 
 basic_entry:
     push bp
@@ -72,6 +75,9 @@ basic_entry:
     mov byte [array_max], 0
     mov byte [return_depth], 0
     mov byte [expression_depth], 0
+    mov byte [key_queue_head], 0
+    mov byte [key_queue_tail], 0
+    mov byte [key_queue_count], 0
     mov word [basic_steps], WATCHDOG_RELOAD
     mov word [basic_line], 0
 
@@ -93,6 +99,8 @@ basic_entry:
     jnc .error
     mov [basic_line], ax
 .execute_statement:
+    call basic_poll_input
+    jc .escaped
     dec word [basic_steps]
     jz .error
     call basic_skip_spaces
@@ -364,13 +372,8 @@ basic_entry:
     jnc .error
     call basic_end_line
     jnc .error
-    call serial_try_read
-    jnc .no_key
-    xor ah, ah
-    jmp .key_store
-.no_key:
-    xor ax, ax
-.key_store:
+    call basic_try_key
+    jc .escaped
     ; A received byte is zero-extended; no-ready is the numeric value zero.
     mov [di], ax
     jmp .continue
@@ -384,6 +387,7 @@ basic_entry:
     call basic_end_line
     jnc .error
     call basic_wait
+    jc .escaped
     mov word [basic_steps], WATCHDOG_RELOAD
     jmp .continue
 
@@ -419,8 +423,17 @@ basic_entry:
     mov si, basic_error_end
 .pause:
     call print_string
-    call serial_read
+    call basic_read_key
+    jc .escaped
+    clc
+    jmp .leave
 
+.escaped:
+    mov si, newline
+    call print_string
+    stc
+
+.leave:
     pop es
     pop ds
     pop bp
@@ -889,6 +902,8 @@ basic_wait:
     sti
     hlt
     popf
+    call basic_poll_input
+    jc .escaped
     mov ah, 0
     int 0x1a
     mov ax, dx
@@ -904,6 +919,8 @@ basic_wait:
     cmp ax, [wait_duration]
     jb .loop
 .done:
+    clc
+.restore:
     pop di
     pop si
     pop dx
@@ -911,6 +928,9 @@ basic_wait:
     pop bx
     pop ax
     ret
+.escaped:
+    stc
+    jmp .restore
 
 basic_print_integer:
     test ax, ax
@@ -991,6 +1011,141 @@ serial_try_read:
     clc
     ret
 
+; Discard bytes that are already part of the same terminal key sequence as an
+; Escape. Waiting across two BIOS tick transitions guarantees one complete tick
+; for a serial ANSI suffix to arrive, keeping it out of the next shell command.
+serial_discard_input:
+    push ax
+    push bx
+    push cx
+    push dx
+    push bp
+    mov ah, 0
+    int 0x1a
+    mov bx, dx
+    mov bp, 2
+.next:
+    call serial_try_read
+    mov ah, 0
+    int 0x1a
+    cmp dx, bx
+    je .next
+    mov bx, dx
+    dec bp
+    jnz .next
+.drain_ready:
+    call serial_try_read
+    jc .drain_ready
+    pop bp
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+; Drain pending serial input on every statement and WAIT tick. Escape is never
+; exposed to a BASIC program; ordinary bytes are retained in arrival order for
+; KEY. Once the bounded queue is full, later ordinary bytes are dropped while
+; polling continues so Escape can still stop a program under input pressure.
+basic_poll_input:
+    push ax
+    push bx
+    push dx
+.next:
+    call serial_try_read
+    jnc .done
+    cmp al, ESCAPE_KEY
+    je .escaped
+    cmp byte [key_queue_count], KEY_QUEUE_CAPACITY
+    jae .next
+    xor bx, bx
+    mov bl, [key_queue_tail]
+    mov [key_queue + bx], al
+    inc bl
+    and bl, KEY_QUEUE_CAPACITY - 1
+    mov [key_queue_tail], bl
+    inc byte [key_queue_count]
+    jmp .next
+.done:
+    pop dx
+    pop bx
+    pop ax
+    clc
+    ret
+.escaped:
+    call serial_discard_input
+    pop dx
+    pop bx
+    pop ax
+    stc
+    ret
+
+; Return AX=0 when no key is ready, otherwise return the next zero-extended
+; input byte. Carry is set instead when a newly arrived Escape requests exit.
+basic_try_key:
+    push bx
+    push dx
+    cmp byte [key_queue_count], 0
+    jne .queued
+    call serial_try_read
+    jnc .none
+    cmp al, ESCAPE_KEY
+    je .escaped
+    xor ah, ah
+    clc
+    jmp .return
+.queued:
+    xor bx, bx
+    mov bl, [key_queue_head]
+    mov al, [key_queue + bx]
+    inc bl
+    and bl, KEY_QUEUE_CAPACITY - 1
+    mov [key_queue_head], bl
+    dec byte [key_queue_count]
+    xor ah, ah
+    clc
+    jmp .return
+.none:
+    xor ax, ax
+    clc
+    jmp .return
+.escaped:
+    call serial_discard_input
+    stc
+.return:
+    pop dx
+    pop bx
+    ret
+
+; Completion and error screens still accept any ordinary key. Prefer an input
+; byte that the global poll already buffered before blocking on COM1, and keep
+; Escape's direct-to-terminal behavior while a completion screen is visible.
+basic_read_key:
+    push bx
+    cmp byte [key_queue_count], 0
+    je .serial
+    xor bx, bx
+    mov bl, [key_queue_head]
+    mov al, [key_queue + bx]
+    inc bl
+    and bl, KEY_QUEUE_CAPACITY - 1
+    mov [key_queue_head], bl
+    dec byte [key_queue_count]
+    pop bx
+    jmp .classify
+.serial:
+    pop bx
+    call serial_read
+.classify:
+    cmp al, ESCAPE_KEY
+    je .escaped
+    clc
+    ret
+.escaped:
+    call serial_discard_input
+    stc
+    ret
+
 basic_output     db 27, '[2J', 27, '[H', 'Nixodria BASIC', 13, 10, 13, 10, 0
 basic_finished   db 13, 10, 'Program finished. Press any key.', 0
 basic_error      db 13, 10, 'BASIC error at line ', 0
@@ -1037,5 +1192,9 @@ print_suppressed       db 0
 wait_duration          dw 0
 wait_start_low         dw 0
 wait_start_high        dw 0
+key_queue_head         db 0
+key_queue_tail         db 0
+key_queue_count        db 0
+key_queue              times KEY_QUEUE_CAPACITY db 0
 
 times (16 * 512) - ($ - $$) db 0
