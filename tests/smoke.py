@@ -28,6 +28,7 @@ STORAGE_END = STORAGE_OFFSET + 2 * SNAPSHOT_SIZE
 PRINT_MODULE_SECTORS = 32
 BASIC_MODULE_OFFSET = STORAGE_END + PRINT_MODULE_SECTORS * SECTOR_SIZE
 BASIC_MODULE_SECTORS = 16
+BASIC_KEY_QUEUE_CAPACITY = 16
 PACKAGE_CATALOG_OFFSET = BASIC_MODULE_OFFSET + BASIC_MODULE_SECTORS * SECTOR_SIZE
 PACKAGE_SLOT_SECTORS = 5
 PACKAGE_SLOT_SIZE = PACKAGE_SLOT_SECTORS * SECTOR_SIZE
@@ -1024,8 +1025,61 @@ def exercise_extended_basic(qemu: str, image: Path) -> None:
         cursor = session.wait_for(b"KEY 90\r\n" + BASIC_FINISHED, cursor)
         session.write(b" ")
         cursor = session.wait_for(editor_frame(filename) + program, cursor)
-        session.write(b"\x18")
+
+        escape_program = (
+            b'10 print "WAITING"\r\n'
+            b"20 wait 1000\r\n"
+            b"30 goto 20"
+        )
+        session.write(b"\x0c")
+        cursor = session.wait_for(editor_frame(filename), cursor)
+        session.write(escape_program + b"\x12")
+        cursor = session.wait_for(
+            escape_program + BASIC_FRAME + b"WAITING\r\n", cursor
+        )
+        escape_start = cursor
+        session.assert_quiet(len(session.transcript), timeout=0.2)
+        session.write(b"Z" * BASIC_KEY_QUEUE_CAPACITY)
+        session.assert_quiet(len(session.transcript), timeout=0.2)
+        session.write(b"OVERFLOW\x1b")
         cursor = session.wait_for(b"\r\nnix> ", cursor)
+        if BASIC_FINISHED in session.transcript[escape_start:cursor]:
+            raise SmokeFailure("Escape waited for the BASIC completion prompt")
+
+        command = b"edit " + filename
+        completed_program = b"10 end"
+        session.write(command + b"\r")
+        cursor = session.wait_for(
+            command + b"\r\n" + editor_frame(filename), cursor
+        )
+        session.write(completed_program + b"\x12")
+        cursor = session.wait_for(
+            completed_program + BASIC_FRAME + BASIC_FINISHED, cursor
+        )
+        escape_start = cursor
+        session.write(b"\x1b")
+        cursor = session.wait_for(b"\r\nnix> ", cursor)
+        if editor_header(filename) in session.transcript[escape_start:cursor]:
+            raise SmokeFailure("Escape returned a completed BASIC run to the editor")
+
+        error_program = b"10 goto 999"
+        session.write(command + b"\r")
+        cursor = session.wait_for(
+            command + b"\r\n" + editor_frame(filename), cursor
+        )
+        session.write(error_program + b"\x12")
+        cursor = session.wait_for(
+            error_program
+            + BASIC_FRAME
+            + b"\r\nBASIC error at line 10. Press any key.",
+            cursor,
+        )
+        escape_start = cursor
+        session.write(b"\x1b")
+        cursor = session.wait_for(b"\r\nnix> ", cursor)
+        if editor_header(filename) in session.transcript[escape_start:cursor]:
+            raise SmokeFailure("Escape returned a failed BASIC run to the editor")
+
         cursor = assert_files(session, (), cursor)
         halt(session, cursor)
 
@@ -1059,6 +1113,26 @@ def exercise_corrupt_basic_module(
         cursor = session.wait_for(b"nix> ", cursor)
         session.write(b"echo OK\r")
         cursor = session.wait_for(b"echo OK\r\nOK\r\nnix> ", cursor)
+
+        command = b"edit TETRIS.BAS"
+        session.write(command + b"\r")
+        cursor = session.wait_for(
+            command
+            + b"\r\n"
+            + editor_frame(b"TETRIS.BAS")
+            + tetris_source,
+            cursor,
+        )
+        session.write(b"\x12")
+        cursor = session.wait_for(
+            CLEAR_SCREEN + b"BASIC runtime unavailable. Press any key.", cursor
+        )
+        escape_start = cursor
+        session.write(b"\x1b")
+        cursor = session.wait_for(b"\r\nnix> ", cursor)
+        if editor_header(b"TETRIS.BAS") in session.transcript[escape_start:cursor]:
+            raise SmokeFailure("Escape returned an unavailable BASIC run to the editor")
+
         halt(session, cursor)
 
     if image.read_bytes() != damaged_before:
@@ -1201,6 +1275,16 @@ def exercise_package_tetris(
         cursor = session.wait_for(BASIC_FINISHED, screen.cursor, timeout=10.0)
         session.write(b" ")
         cursor = session.wait_for(b"nix> ", cursor)
+
+        session.write(b"run TETRIS.BAS\r")
+        cursor = session.wait_for(b"run TETRIS.BAS\r\n" + BASIC_FRAME, cursor)
+        screen = wait_for_tetris_screen(session, cursor, timeout=10.0)
+        escape_start = screen.cursor
+        session.write(b"\x1b[A")
+        cursor = session.wait_for(b"\r\nnix> ", escape_start)
+        if BASIC_FINISHED in session.transcript[escape_start:cursor]:
+            raise SmokeFailure("Escape did not exit the running Tetris package directly")
+
         session.write(b"echo OK\r")
         cursor = session.wait_for(b"echo OK\r\nOK\r\nnix> ", cursor)
         cursor = assert_files(session, (package.filename,), cursor)
@@ -2466,8 +2550,9 @@ def main() -> int:
         return 1
 
     print(
-        "smoke: package install/remove, editable Tetris, named files, extended "
-        "BASIC, persistence, recovery, corruption refusal, and write faults passed"
+        "smoke: package install/remove, editable Tetris, Escape exits, named files, "
+        "extended BASIC, persistence, recovery, corruption refusal, and write "
+        "faults passed"
     )
     return 0
 
