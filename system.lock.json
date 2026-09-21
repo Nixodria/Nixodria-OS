@@ -1,0 +1,10 @@
+{
+  "alpine_version": "3.24.2",
+  "repository_branch": "v3.24",
+  "architecture": "x86_64",
+  "iso_url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/alpine-virt-3.24.2-x86_64.iso",
+  "iso_sha256": "3ab424762af704b2c2a9e57df1dc37f982af260071504d977f2fb96822e7130b",
+  "rust_package": "rust=1.96.1-r0",
+  "cargo_package": "cargo=1.96.1-r0",
+  "system_packages": ["build-base", "cups", "cups-client", "cups-filters"]
+}
