@@ -79,10 +79,13 @@ shell in that guest from your checkout.
 - `guest/selftest.sh` exercises the installed guest compiler and Cargo.
 - `system.lock.json` pins the installer ISO and Rust/Cargo package versions.
 - `tools/build_system.py` prepares and verifies the new system image.
+- `tools/export_utm.py` packages a standalone disk and serial-console VM for UTM.
 - `tools/export_legacy_files.py` and `tools/import_legacy_files.py` recover
   verified old saves to the host or the persistent Rust guest.
 - `build/system/nixodria.qcow2` is the fresh system image.
 - `.nixodria/nixodria-rust.qcow2` is the persistent writable runtime image.
+- `.nixodria/Nixodria.utm` is the independent persistent UTM bundle produced by
+  `make utm`; never overwrite it when rebuilding or exporting.
 - `tools/legacy.mk`, `src/*.asm`, `packages.lock.json`, and the legacy image
   tools/tests preserve the BIOS/BASIC implementation.
 - [docs/legacy.md](docs/legacy.md) documents the old system and file export.
@@ -141,6 +144,9 @@ Android device, or hardware checks have not been run.
 - `make smoke` boots a disposable image without network access and checks native
   Rust/standard-library behavior, Cargo, source changes, and restart persistence.
 - `make run` opens the persistent interactive guest.
+- `make utm` exports a fresh UTM bundle. Validate import, terminal input, guest
+  compilation, networking, clean shutdown, and persistence in UTM separately
+  from the command-line QEMU smoke tests.
 - `make legacy` and `make legacy-smoke` build and exercise the retained BIOS
   system; these need NASM and `qemu-system-i386` as described in the legacy guide.
 
