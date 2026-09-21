@@ -1,3 +1,5 @@
 /build/
 /.nixodria/
 __pycache__/
+/target/
+/legacy-files/

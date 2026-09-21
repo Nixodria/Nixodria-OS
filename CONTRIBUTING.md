@@ -1,284 +1,181 @@
 # Contributing to Nixodria OS
 
-Thank you for helping improve Nixodria OS. Contributions should preserve the
-project's deliberately small, understandable 16-bit BIOS design and include
-verification appropriate to the behavior being changed.
+Nixodria OS 2 provides Rust development with compilation and execution inside
+the booted OS. Its foundation is the Linux kernel and Alpine userspace, with a
+Rust shell and editable Rust applications. The former BIOS/BASIC system remains
+a separate legacy target.
 
 By participating, you agree to follow the [Code of Conduct](CODE_OF_CONDUCT.md).
+Search the [issue tracker](https://github.com/Nixodria/Nixodria-OS/issues) for
+related work, keep changes focused, and explain compatibility consequences.
+An existing issue is helpful context, not a prerequisite for a clear fix.
 
-## Before you start
+## Application policy: editable Rust source
 
-- Search the [issue tracker](https://github.com/Nixodria/Nixodria-OS/issues) for
-  related reports or proposals.
-- Open an issue before investing in a large change, especially one that alters
-  the disk format, memory layout, BASIC language, or overall system scope.
-- Keep each pull request focused on one problem. Small patches are easier to
-  reason about in a memory-constrained real-mode system.
+Every application contributed for inclusion in the current Nixodria OS must be
+written and shared as editable Rust source. This includes games, calculators,
+utilities, and other Nixodria applications. The bundled catalog currently lives
+in this repository's `apps/` directory. The external Nixodria Packages BASIC
+catalog remains part of the legacy build and is not the current Rust catalog.
 
-Bug fixes, tests, and documentation corrections are welcome without a prior
-proposal when their scope and expected behavior are clear.
+This requirement applies equally to the founder, maintainers, organization
+members, and first-time contributors. A role or repository permission does not
+create an exception. Application behavior must remain in its published source;
+do not hide game or utility logic in the shell or ship only an opaque binary.
 
-## Application policy: Nixodria BASIC
+Use the real guest Rust compiler and standard library. Applications must not
+require an unpublished language variant, private runtime changes, or a host
+compiler to work in Nixodria. Publish every required Nixodria source or runtime
+change in the same contribution or a linked prerequisite, with documentation
+and relevant verification. Coordinate dependent releases so that the required
+runtime is available before an application depends on it.
 
-Every application contributed for inclusion in Nixodria OS must be written and
-shared as editable source code in Nixodria's built-in flavor of BASIC. This
-includes calculators, games, utilities, and every other user-facing program
-intended to run within the OS. Application source and catalog metadata belong
-in the public
-[`Nixodria/Nixodria-Packages`](https://github.com/Nixodria/Nixodria-Packages)
-repository; this repository pins a reviewed package-catalog release.
-
-This rule applies equally to everyone. The founder, maintainers, members of the
-Nixodria organization, established contributors, and first-time newcomers all
-follow the same application-language requirement. A title, role, or repository
-permission does not create an exception.
-
-Contributors are free to create, modify, refactor, and extend the BASIC source
-code for their applications. The resulting application must still remain a
-Nixodria BASIC program. For example, a contributed calculator must be BASIC
-source run by Nixodria's interpreter, not calculator logic added directly to
-`src/boot.asm`.
-
-The existing built-in text editor is the only application exception. It was
-created before Nixodria BASIC existed, so its assembly implementation may be
-maintained, refactored, expanded, and enhanced. New features that are genuinely
-part of the text editor remain covered by this exception. The exception may not
-be used to fold an unrelated application or utility into the editor, and it
-does not extend to any other new application.
-
-This policy applies to applications, not to the core implementation of the OS.
-The bootloader, kernel, shell, editor, BASIC interpreter, and platform support
-may continue to use assembly or repository tooling where appropriate. If BASIC
-lacks a capability that an application needs, propose and test that language or
-runtime capability separately; do not bypass the policy by implementing the
-application itself as native assembly or in another language.
-
-Contributors must also share every change they make to Nixodria BASIC itself.
-This includes changes to its syntax, language behavior, built-ins, interpreter,
-or runtime support. Publish those changes here in a linked prerequisite or
-coordinated pull request, together with relevant documentation and tests. Land
-and release the interpreter support before updating the package catalog pin. An
-application must not depend on a private or unpublished variant of Nixodria
-BASIC.
+The application-language policy does not require rewriting existing upstream
+system dependencies. Linux, Alpine, the C library, compiler backends, `vi`, CUPS,
+and other platform utilities may use their upstream implementation languages.
+Build and test tooling may use Python or shell. These dependencies support Rust
+development; they are not a route for submitting a new Nixodria application in
+another language. The retained BIOS/BASIC code is historical compatibility code.
 
 ### Package governance
 
 The Nixodria project owner retains the right to create, revise, replace, and
-enforce the rules governing packages distributed through the official OS
-package manager. This authority includes package eligibility, source and file
-formats, technical compatibility, safety and quality requirements, review,
-versioning, installation behavior, deprecation, and removal from the official
-catalog. These examples do not limit that authority; the owner may establish
-other package rules as the project evolves.
+enforce rules for packages distributed through the official package manager.
+This includes eligibility, source formats, compatibility, safety and quality,
+review, versioning, installation, deprecation, and removal. These examples do
+not limit that authority.
 
-Package rules may evolve as Nixodria OS evolves. A change becomes an official
-project rule when it is published in the Nixodria OS or Nixodria Packages
-repository and, when necessary, reflected in the package-manager implementation
-or catalog. Until a published rule is changed, it applies to every official
-package submission and maintainer action, including those made by the project
-owner. Forks may adopt different rules but may not present their catalogs as the
-official Nixodria package catalog. Submission or past inclusion does not
-guarantee acceptance or continued distribution in the official catalog.
+Rule changes become official when published in the Nixodria OS or Nixodria
+Packages repository and reflected in the implementation when necessary. Until a
+published rule changes, it applies to every official contribution and maintainer
+action, including those of the owner. Forks may use different rules but must not
+present their catalogs as the official Nixodria catalog. Past inclusion does not
+guarantee continued distribution.
 
 ## Development environment
 
-You need:
-
-- NASM
-- Python 3.10 or newer
-- GNU Make
-- QEMU with `qemu-system-i386`
-
-On macOS with Homebrew, install the non-system dependencies with:
+The default build needs Python 3.10 or newer, Make, `qemu-system-x86_64`, and
+`qemu-img` on the host. The initial installation downloads the pinned Alpine
+ISO and signed packages. Rust and Cargo are installed and executed in the guest;
+host Rust, NASM, Docker, and root access are not required.
 
 ```sh
-brew install nasm qemu
-```
-
-Build and verify a checkout before making changes:
-
-```sh
-make clean
+brew install python qemu
+make
+make check
 make smoke
 ```
 
-The Makefile defaults to `nasm`, `python3`, and `qemu-system-i386`. You can
-override those commands when necessary, for example:
-
-```sh
-make PYTHON=python3.12 QEMU=/path/to/qemu-system-i386 smoke
-```
-
-Exact tool versions are not pinned. If a failure appears version-specific,
-include the relevant version output in your issue or pull request.
+The VM defaults to 2 GiB RAM, an 8 GiB sparse disk, and x86_64 TCG emulation.
+Building large projects may need more resources. Run `make run` to use the
+persistent guest, and shut it down before running `make update` to rebuild the
+shell in that guest from your checkout.
 
 ## Repository layout
 
-- `src/boot.asm` contains the boot sector, resident real-mode kernel, shell,
-  editor, durable storage implementation, and checked module loaders.
-- `src/basic.asm` contains the demand-loaded Nixodria BASIC interpreter and its
-  general-purpose interactive runtime support.
-- `src/print.asm` contains the demand-loaded NE2000, TCP/IP, IPP, and raster
-  printing module.
-- `packages.lock.json` pins the public package-catalog release and SHA-256.
-- `tools/fetch_package_catalog.py` downloads and verifies that exact release
-  artifact into the ignored local cache.
-- `tools/build_image.py` installs both modules and the verified package catalog
-  after the file snapshots.
-- `tools/prepare_runtime_image.py` creates or safely refreshes the writable
-  runtime image while preserving its file snapshots.
-- `tests/check_image.py` validates the assembled image's static invariants.
-- `tests/check_runtime_image.py` checks runtime-image creation, migration, and
-  failure safety.
-- `tests/smoke.py` boots temporary images in QEMU and exercises the system over
-  its serial console.
-- `tests/check_native_print.py` uses a local fake IPP printer to verify the
-  guest-generated request and raster pages over the emulated network.
-- `build/nixodria.img` is the reproducible blank build output.
-- `.nixodria/nixodria.img` is the local writable runtime image and can contain a
-  user's saved files.
-- `.nixodria/nixodria-packages.bin` is the verified package-catalog cache.
+- `Cargo.toml` and `src/main.rs` define the Rust shell.
+- `apps/HELLO.rs` and `apps/TETRIS.rs` are editable bundled applications.
+- `guest/install.sh` builds and installs Nixodria inside the guest.
+- `guest/selftest.sh` exercises the installed guest compiler and Cargo.
+- `system.lock.json` pins the installer ISO and Rust/Cargo package versions.
+- `tools/build_system.py` prepares and verifies the new system image.
+- `tools/export_legacy_files.py` and `tools/import_legacy_files.py` recover
+  verified old saves to the host or the persistent Rust guest.
+- `build/system/nixodria.qcow2` is the fresh system image.
+- `.nixodria/nixodria-rust.qcow2` is the persistent writable runtime image.
+- `tools/legacy.mk`, `src/*.asm`, `packages.lock.json`, and the legacy image
+  tools/tests preserve the BIOS/BASIC implementation.
+- [docs/legacy.md](docs/legacy.md) documents the old system and file export.
 
-`build/`, `.nixodria/`, and Python cache directories are generated locally and
-must not be committed.
+Generated images, downloaded artifacts, caches, and runtime state must not be
+committed. A runtime image can contain private source and credentials.
 
-## Making changes
+## Changing the system
 
-### Preserve image and boot invariants
+### Keep compilation in the guest
 
-The current image is a standard 1.44 MiB floppy: one 512-byte BIOS boot sector,
-a ten-sector resident kernel, two 33-sector file snapshots, a 32-sector native
-printer-module slot, a 16-sector BASIC-module slot, and eight five-sector
-package slots. Each package slot contains one checked header sector and four
-source sectors. Each writable snapshot contains one directory sector and eight
-fixed four-sector file slots. The first sector must retain its `55 aa` BIOS
-signature, a freshly built image must have blank snapshots, and sectors after
-the package catalog must remain blank.
+Preserve the complete workflow: edit source in Nixodria, invoke its `rustc` or
+Cargo, and execute the resulting program there. A host compilation producing a
+guest binary does not verify this workflow. Use standard Rust behavior and
+report unsupported dependencies honestly.
 
-If a change intentionally alters the image layout, update every affected
-constant and assumption together in:
-
-- `src/boot.asm`
-- `Makefile`
-- `tools/build_image.py`
-- `tools/prepare_runtime_image.py`
-- `tests/check_image.py`
-- `tests/check_runtime_image.py`
-- `tests/smoke.py`
-- `README.md`
-- `CONTRIBUTING.md`
-
-Preserve compatibility with existing runtime images when the layout changes, or
-document and test an intentional migration path.
-
-Do not weaken the size, bounds, checksum, or warning-as-error checks merely to
-make a larger image build.
+Keep the shell's source catalog editable. Installing an entry must not silently
+overwrite local changes. Make it clear when an explicit `sh -c` invocation is
+needed for expansion or redirection.
 
 ### Protect persistent data
 
-Normal rebuilds replace the runtime image's immutable boot, kernel, printer and
-BASIC modules, package catalog, and unused sectors. They must not overwrite
-either file snapshot. `make clean` intentionally removes `build/` but leaves
-the runtime image and verified package-catalog cache under `.nixodria/` intact.
+Rebuilding the base image must not replace an existing runtime disk. Updates
+must preserve workspace files and report failures accurately. Avoid concurrent
+VM access to a writable image. Refuse ambiguous paths or incompatible image
+formats rather than guessing which disk should be modified.
 
-Changes to runtime-image handling or editor saves must remain fail-closed:
-malformed images and symbolic links must not be overwritten, runtime files must
-remain mode `0600` on POSIX hosts, failed writes must not be reported as
-successful, and the previous verified save must remain recoverable after an
-interrupted or corrupt write.
+Legacy `.nixodria/nixodria.img` files must remain separate from the new qcow2
+disk. Export reads verified saved text into a host directory. Import copies
+that text into a separate `/root/workspace/legacy-<image-hash12>` guest directory
+without overwriting existing files. Neither modifies the original image or
+translates BASIC into Rust. Preserve legacy snapshot validation and recovery
+when changing those tools. `make clean` must retain runtime files and caches.
 
-Do not attach a runtime image to a public issue without first checking its
-contents; it may contain text saved in the editor.
+### Keep provenance clear
 
-### Follow the existing style
+Verify the installation ISO against `system.lock.json`, keep Alpine package
+signature verification enabled, and record installed package versions.
+Rust/Cargo are pinned; their transitive packages come from the maintained Alpine
+branch. Do not describe the entire disk image as reproducible unless its inputs
+and image-generation behavior have actually been made reproducible.
 
-- Match the formatting and naming in the surrounding assembly or Python code.
-- Keep real-mode memory use, register ownership, and BIOS side effects explicit.
-- Comment constraints and non-obvious safety decisions, not line-by-line
-  mechanics.
-- Avoid adding a dependency when the standard library or existing toolchain is
-  sufficient. Document any new required dependency.
-- Update the README when commands, controls, supported BASIC syntax, image
-  layout, or other user-visible behavior changes.
+The local serial shell runs as root. Programs and Cargo build scripts have full
+guest privileges; do not imply application isolation. QEMU uses user networking
+without incoming port forwarding. Adding a network service, privilege boundary,
+or host integration requires corresponding documentation and verification.
 
-## Testing
+Keep commands, editor controls, package behavior, and migration instructions in
+the README synchronized with the implementation. State when physical printer,
+Android device, or hardware checks have not been run.
 
-The repository provides these validation targets:
+## Verification
 
-- `make` assembles `build/nixodria.img` with NASM warnings treated as errors.
-- `make check` validates the image layout and runtime-image preparation logic.
-- `make smoke` runs `make check`, then exercises the shell, editor, BASIC
-  interpreter and interactive runtime, package listing/install/removal, Tetris,
-  persistence, recovery, write-failure behavior, and a complete native print
-  submission to a local fake IPP printer in QEMU.
-- `make run` starts an interactive session on the headless COM1 serial console.
-  Press Control-C to stop QEMU.
+- `make` bootstraps the disk and compiles the shell inside the guest.
+- `make check` runs host checks and qcow2 validation.
+- `make smoke` boots a disposable image without network access and checks native
+  Rust/standard-library behavior, Cargo, source changes, and restart persistence.
+- `make run` opens the persistent interactive guest.
+- `make legacy` and `make legacy-smoke` build and exercise the retained BIOS
+  system; these need NASM and `qemu-system-i386` as described in the legacy guide.
 
-For code, tests, or tools, run the full local gate before opening a pull request:
+For behavioral changes, extend the closest relevant check with observable
+behavior. Compiler success alone is not enough for terminal handling,
+persistence, or printing. Tests that run in a disposable VM must not overwrite
+the user's runtime disk. Separate mocked printer transport tests from physical
+output.
 
-```sh
-make clean
-make smoke
-git diff --check
-```
-
-For documentation-only changes, run `git diff --check` and manually verify all
-changed commands and links. If you cannot run an applicable check, say which
-one was skipped and why in the pull request.
-
-Behavior changes should include automated coverage in the closest existing
-test. Prefer extending the QEMU smoke test for guest-visible behavior and the
-focused Python checks for image-layout or runtime-image rules.
+Run applicable checks and `git diff --check` before submitting. For a
+documentation-only change, verify commands and links and run the whitespace
+check. Report exact results and skipped checks in the pull request; do not turn
+an unrun guest, device, or hardware check into a passing claim.
 
 ## Commits and pull requests
 
-Create a short-lived branch with a descriptive name such as
-`feature/basic-input`, `fix/storage-recovery`, or `docs/build-notes`.
-
-Conventional Commit subjects are preferred. Keep them concise, imperative, and
-focused on the project, for example:
+Use a descriptive branch and a concise Conventional Commit subject, for example:
 
 ```text
-feat(editor): add cursor movement
-fix(storage): preserve the previous valid record
-docs: clarify QEMU setup
-test: cover BASIC overflow handling
+feat(shell): support Rust source execution
+fix(storage): preserve workspace during updates
+test: verify Cargo builds inside the guest
+docs: explain the Linux system foundation
 ```
 
-A pull request should include:
-
-- A clear summary of the change and why it is needed.
-- The user-visible and compatibility impact, if any.
-- The exact validation commands run and their results.
-- Tests for changed behavior.
-- Documentation updates for changed commands or behavior.
-- A linked issue when one exists.
-
-Before submitting, confirm that:
-
-- [ ] The diff contains only files relevant to the change.
-- [ ] Generated images, runtime state, and cache files are not included.
-- [ ] Every new application is implemented in Nixodria BASIC; only the existing
-      pre-BASIC text editor and genuine enhancements to it are exempt.
-- [ ] The complete application source and every required Nixodria BASIC change
-      are published in coordinated package and OS pull requests, with OS runtime
-      support released before the package catalog depends on it.
-- [ ] Image, memory, and persistent-storage invariants still hold.
-- [ ] Applicable automated tests pass.
-- [ ] `git diff --check` reports no whitespace errors.
-- [ ] User-facing documentation is accurate.
-- [ ] The contribution follows the Code of Conduct.
+A pull request should explain the problem, resulting behavior, compatibility
+impact, and verification. Include source/runtime prerequisites and a linked
+issue when one exists. Check that the diff contains only intended files and
+that application source, documentation, and relevant tests are included.
 
 ## Reporting bugs
 
-Open a GitHub issue with the smallest reproducible example you can provide.
-Include:
-
-- The host operating system and architecture.
-- NASM, Python, Make, and QEMU versions.
-- The command you ran and complete error output or serial transcript.
-- What you expected and what happened instead.
-- Whether the problem occurs with a newly built blank image, an existing
-  runtime image, or both.
-
-Redact private text from serial transcripts and runtime-image diagnostics.
+Include the host OS and architecture, Python/Make/QEMU versions, the failed
+command, and a minimal source example or serial transcript. From a booted guest,
+include `rustc --version`, `cargo --version`, and relevant entries from
+`/usr/lib/nixodria/packages.txt`. Say whether the problem affects a fresh image,
+an existing runtime image, or the legacy build. Remove private text and secrets
+from transcripts and diagnostics before publishing them.
