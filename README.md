@@ -48,6 +48,32 @@ Silicon. The serial console runs at 115200 baud. `make run` starts the persisten
 disk at `.nixodria/nixodria-rust.qcow2`; use `halt` for a clean shutdown. Control-C
 interrupts a foreground guest program. Escape is handled by each application.
 
+## Run in UTM on macOS
+
+Install [UTM for macOS](https://docs.getutm.app/installation/macos/), then create
+and open a ready-to-run VM:
+
+```sh
+make utm
+open -a UTM .nixodria/Nixodria.utm
+```
+
+Press Play in UTM. The built-in terminal boots directly to `nix>`, where you can
+edit, compile, and run Rust. Type `halt` to shut down cleanly. The bundle includes
+its own writable disk, and saved files survive stopping and restarting UTM.
+No installer ISO or manual virtual-hardware setup is needed.
+
+The VM uses x86_64 emulation on both Apple Silicon and Intel Macs, BIOS boot,
+2 GiB RAM, two virtual CPUs, VirtIO storage/networking, and a serial terminal.
+This is a terminal OS; there is no graphical desktop. Apple Silicon runs this
+x86_64 image through emulation, so compilation is slower than native ARM code.
+
+The exporter copies the fresh system image and refuses to replace an existing
+bundle. Your `make run` disk and your UTM disk are independent. `make clean`
+preserves the default UTM bundle under `.nixodria/`. See the
+[UTM guide](docs/utm.md) for export locations, existing-file migration, backups,
+and manual settings.
+
 ## Write Rust inside Nixodria
 
 At the `nix>` prompt:

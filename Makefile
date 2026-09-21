@@ -2,9 +2,10 @@ PYTHON ?= python3
 QEMU ?= qemu-system-x86_64
 QEMU_IMG ?= qemu-img
 OUTPUT ?= legacy-files
+UTM_OUTPUT ?= .nixodria/Nixodria.utm
 export QEMU QEMU_IMG
 
-.PHONY: all check smoke run runtime-image update export-legacy import-legacy legacy legacy-smoke clean
+.PHONY: all check smoke run runtime-image utm update export-legacy import-legacy legacy legacy-smoke clean
 
 all:
 	$(PYTHON) tools/build_system.py build
@@ -22,6 +23,9 @@ runtime-image: all
 
 run: runtime-image
 	$(PYTHON) tools/build_system.py run
+
+utm: all
+	$(PYTHON) tools/export_utm.py --output "$(UTM_OUTPUT)"
 
 update: all
 	$(PYTHON) tools/build_system.py update
